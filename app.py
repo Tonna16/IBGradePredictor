@@ -33,6 +33,8 @@ class SubjectPrediction:
     predicted_grade: int
     gap_to_next_grade: float
     needed_exam_avg_for_next: float | None
+    needed_ia_for_next: float | None
+    ia_confidence_label: str
 
 
 def default_subject(name: str = "New Subject") -> Subject:
@@ -70,15 +72,27 @@ def weighted_average(scores: List[float]) -> float:
     return sum(s * w for s, w in zip(scores, weights)) / sum(weights)
 
 
-def needed_exam_avg_for_target(
+def needed_test_avg_for_target(
     target_score: float,
     ia_estimated_score: float,
     exam_weight: float,
     ia_weight: float,
-) -> float:
+) -> float | None:
     if exam_weight <= 0:
-        return 100.0
+        return None
     needed = (target_score - ia_estimated_score * ia_weight) / exam_weight
+    return max(0.0, min(100.0, needed))
+
+
+def needed_ia_quality_for_target(
+    target_score: float,
+    exam_avg: float,
+    exam_weight: float,
+    ia_weight: float,
+) -> float | None:
+    if ia_weight <= 0:
+        return None
+    needed = (target_score - exam_avg * exam_weight) / ia_weight
     return max(0.0, min(100.0, needed))
 
 
@@ -102,12 +116,20 @@ def normalize_weights(exam_weight: float, ia_weight: float) -> tuple[float, floa
     return exam_weight / total, ia_weight / total
 
 
-def predict_subject(subject: Subject) -> SubjectPrediction:
+def ia_confidence_from_progress(ia_progress_pct: float) -> str:
+    if ia_progress_pct < 35:
+        return "Low confidence (IA estimate likely to move)"
+    if ia_progress_pct < 70:
+        return "Medium confidence"
+    return "High confidence"
+
+
+def predict(subject: Subject) -> SubjectPrediction:
     exam_avg = weighted_average(subject.test_scores)
     ia_est = subject.ia_estimated_score or 0.0
 
-    current_ia_contrib = ia_est * (subject.ia_progress_pct / 100)
-    current = exam_avg * subject.exam_weight + current_ia_contrib * subject.ia_weight
+    # IB-style weighted composition: IA contribution is not reduced by progress.
+    current = exam_avg * subject.exam_weight + ia_est * subject.ia_weight
     current = max(0.0, min(100.0, current))
 
     predicted_final = exam_avg * subject.exam_weight + ia_est * subject.ia_weight
@@ -117,11 +139,14 @@ def predict_subject(subject: Subject) -> SubjectPrediction:
     next_threshold = next_grade_threshold(grade)
     if next_threshold is None:
         gap_to_next = 0.0
-        needed_exam = None
+        needed_exam, needed_ia = None, None
     else:
         gap_to_next = max(0.0, next_threshold - predicted_final)
-        needed_exam = needed_exam_avg_for_target(
+        needed_exam = needed_test_avg_for_target(
             next_threshold, ia_est, subject.exam_weight, subject.ia_weight
+        )
+        needed_ia = needed_ia_quality_for_target(
+            next_threshold, exam_avg, subject.exam_weight, subject.ia_weight
         )
 
     return SubjectPrediction(
@@ -130,7 +155,24 @@ def predict_subject(subject: Subject) -> SubjectPrediction:
         predicted_grade=grade,
         gap_to_next_grade=gap_to_next,
         needed_exam_avg_for_next=needed_exam,
+        needed_ia_for_next=needed_ia,
+        ia_confidence_label=ia_confidence_from_progress(subject.ia_progress_pct),
     )
+
+
+def needed_exam_avg_for_target(
+    target_score: float,
+    ia_estimated_score: float,
+    exam_weight: float,
+    ia_weight: float,
+) -> float | None:
+    # Backward-compatible alias.
+    return needed_test_avg_for_target(target_score, ia_estimated_score, exam_weight, ia_weight)
+
+
+def predict_subject(subject: Subject) -> SubjectPrediction:
+    # Backward-compatible alias.
+    return predict(subject)
 
 
 def subject_to_dict(subject: Subject) -> dict[str, Any]:
@@ -218,7 +260,13 @@ def main() -> None:
             test_scores = parse_scores(scores_raw)
 
             c1, c2, c3 = st.columns(3)
-            ia_progress = c1.slider("IA progress %", 0, 100, int(subject.ia_progress_pct), key=f"prog_{idx}")
+            ia_progress = c1.slider(
+                "IA progress (%) — confidence only",
+                0,
+                100,
+                int(subject.ia_progress_pct),
+                key=f"prog_{idx}",
+            )
             unknown_ia = c2.checkbox(
                 "IA estimate unknown",
                 value=subject.ia_estimated_score is None,
@@ -228,7 +276,7 @@ def main() -> None:
             if unknown_ia:
                 ia_estimated_score = None
                 c3.number_input(
-                    "IA estimate %",
+                    "Estimated final IA score (%)",
                     min_value=0.0,
                     max_value=100.0,
                     value=0.0,
@@ -238,7 +286,7 @@ def main() -> None:
             else:
                 default_ia = 70.0 if subject.ia_estimated_score is None else float(subject.ia_estimated_score)
                 ia_estimated_score = c3.number_input(
-                    "IA estimate %",
+                    "Estimated final IA score (%)",
                     min_value=0.0,
                     max_value=100.0,
                     value=default_ia,
@@ -297,7 +345,7 @@ def main() -> None:
 
     summary_rows = []
     for subject in valid_subjects:
-        pred = predict_subject(subject)
+        pred = predict(subject)
         needed_text = (
             "Already Grade 7"
             if pred.needed_exam_avg_for_next is None
@@ -309,6 +357,7 @@ def main() -> None:
                 "Current weighted standing": round(pred.current_weighted_standing, 1),
                 "Predicted final %": round(pred.predicted_final_percentage, 1),
                 "Predicted IB grade": pred.predicted_grade,
+                "IA confidence": pred.ia_confidence_label,
                 "Needed for next grade": needed_text,
             }
         )
@@ -318,7 +367,7 @@ def main() -> None:
     st.subheader("Priority ranking")
     ranking = []
     for subject in valid_subjects:
-        pred = predict_subject(subject)
+        pred = predict(subject)
         effort_metric = pred.gap_to_next_grade
         exam_need_metric = pred.needed_exam_avg_for_next or 0.0
         ranking.append(
@@ -345,8 +394,8 @@ def main() -> None:
         st.markdown(
             """
             - Recent test scores are weighted slightly more heavily.
-            - Current standing includes only completed IA progress.
-            - Predicted final assumes IA reaches the estimated final score.
+            - Predicted outcome uses IB-style weighting: exam + final IA estimate.
+            - IA progress is used only for confidence/risk messaging.
             - Priority ranking surfaces subjects with the largest climb to the next grade.
             """
         )
