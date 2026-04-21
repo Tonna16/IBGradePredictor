@@ -59,6 +59,13 @@ class TrendInsight:
     tests_used: int
 
 
+@dataclass
+class RiskAlert:
+    title: str
+    reason: str
+    threshold_text: str
+
+
 def default_subject(name: str = "New Subject") -> Subject:
     return Subject(
         name=name,
@@ -332,6 +339,108 @@ def predict(subject: Subject) -> SubjectPrediction:
         confidence_level=confidence_level,
         confidence_summary=confidence_summary,
     )
+
+
+def max_grade_with_ia_ceiling(ia_estimated_score: float, exam_weight: float, ia_weight: float) -> tuple[int, float]:
+    max_final_pct = max(0.0, min(100.0, 100.0 * exam_weight + ia_estimated_score * ia_weight))
+    return grade_from_score(max_final_pct), max_final_pct
+
+
+def risk_alerts(subject: Subject, prediction: SubjectPrediction) -> List[RiskAlert]:
+    alerts: List[RiskAlert] = []
+    trend = calculate_trend(subject.test_scores)
+    volatility = pstdev(subject.test_scores) if len(subject.test_scores) >= 2 else 0.0
+
+    if subject.ia_estimated_score is not None:
+        max_grade, max_final = max_grade_with_ia_ceiling(
+            subject.ia_estimated_score, subject.exam_weight, subject.ia_weight
+        )
+        if max_grade < subject.target_grade:
+            alerts.append(
+                RiskAlert(
+                    title="IA ceiling limits maximum achievable grade",
+                    reason=(
+                        f"Even with perfect exams, ceiling is Grade {max_grade} "
+                        f"({max_final:.1f}%), below target Grade {subject.target_grade}."
+                    ),
+                    threshold_text=(
+                        f"Threshold check: max_grade={max_grade} < target_grade={subject.target_grade}"
+                    ),
+                )
+            )
+
+    exam_heavy_threshold = 0.75
+    decline_threshold = -0.8
+    slope = 0.0 if trend is None else trend.slope_per_test
+    if subject.exam_weight >= exam_heavy_threshold and slope <= decline_threshold:
+        alerts.append(
+            RiskAlert(
+                title="Over-reliance on exams while trend is weak",
+                reason=(
+                    f"Exam weighting is high ({subject.exam_weight:.2f}) and recent slope is "
+                    f"{slope:+.2f} pts/test."
+                ),
+                threshold_text=(
+                    f"Threshold check: exam_weight ≥ {exam_heavy_threshold:.2f} and "
+                    f"slope ≤ {decline_threshold:+.2f}"
+                ),
+            )
+        )
+
+    volatility_threshold = 10.0
+    if volatility >= volatility_threshold:
+        alerts.append(
+            RiskAlert(
+                title="High volatility / inconsistency warning",
+                reason=f"Score volatility is {volatility:.1f} across {len(subject.test_scores)} tests.",
+                threshold_text=f"Threshold check: stdev={volatility:.1f} ≥ {volatility_threshold:.1f}",
+            )
+        )
+
+    if prediction.confidence_level == "Low":
+        alerts.append(
+            RiskAlert(
+                title="Forecast confidence is low",
+                reason=prediction.confidence_summary,
+                threshold_text="Threshold check: confidence score < 45",
+            )
+        )
+
+    return alerts
+
+
+def scenario_subject(subject: Subject, next_test_score: float, ia_estimate: float) -> Subject:
+    return Subject(
+        name=subject.name,
+        test_scores=subject.test_scores + [next_test_score],
+        assessment_dates=subject.assessment_dates,
+        ia_progress_pct=subject.ia_progress_pct,
+        ia_estimated_score=ia_estimate,
+        exam_weight=subject.exam_weight,
+        ia_weight=subject.ia_weight,
+        remaining_exam_count=subject.remaining_exam_count,
+        remaining_exam_weights=subject.remaining_exam_weights,
+        expected_remaining_exam_avg=subject.expected_remaining_exam_avg,
+        target_grade=subject.target_grade,
+    )
+
+
+def scenario_chart_data(subject: Subject, next_test_score: float) -> dict[str, list[float | str]]:
+    labels = [f"T{i + 1}" for i in range(len(subject.test_scores))]
+    labels.append("Next")
+    for i in range(max(0, subject.remaining_exam_count - 1)):
+        labels.append(f"R{i + 1}")
+
+    history: list[float] = subject.test_scores + [float("nan")] * (len(labels) - len(subject.test_scores))
+    projection_tail = [next_test_score] + [subject.expected_remaining_exam_avg] * max(
+        0, subject.remaining_exam_count - 1
+    )
+    projected_path: list[float] = (
+        [float("nan")] * len(subject.test_scores) + projection_tail
+        if projection_tail
+        else [float("nan")] * len(labels)
+    )
+    return {"Point": labels, "Score history": history, "Projected path": projected_path}
 
 
 def needed_exam_avg_for_target(
@@ -649,6 +758,87 @@ def main() -> None:
         )
 
     st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Risk & scenario intervention planner")
+    for idx, subject in enumerate(valid_subjects):
+        baseline_pred = predict(subject)
+        with st.container(border=True):
+            st.markdown(f"**{subject.name}**")
+            alerts = risk_alerts(subject, baseline_pred)
+            if alerts:
+                for alert in alerts:
+                    st.error(f"**{alert.title}**\n\n{alert.reason}\n\n{alert.threshold_text}")
+            else:
+                st.success("No immediate risk flags under current thresholds.")
+
+            sc1, sc2 = st.columns(2)
+            next_test_default = int(round(subject.expected_remaining_exam_avg))
+            next_test_score = sc1.slider(
+                "What if next test is X%?",
+                0,
+                100,
+                max(0, min(100, next_test_default)),
+                key=f"scenario_next_test_{idx}",
+            )
+            scenario_ia_default = (
+                int(round(subject.ia_estimated_score))
+                if subject.ia_estimated_score is not None
+                else 70
+            )
+            scenario_ia = sc2.slider(
+                "What if IA estimate becomes Y%?",
+                0,
+                100,
+                max(0, min(100, scenario_ia_default)),
+                key=f"scenario_ia_{idx}",
+            )
+
+            sim_subject = scenario_subject(subject, float(next_test_score), float(scenario_ia))
+            sim_pred = predict(sim_subject)
+            st.info(
+                "Scenario result: "
+                f"{sim_pred.predicted_final_percentage:.1f}% (Grade {sim_pred.predicted_grade}) · "
+                f"{sim_pred.confidence_level} confidence ({sim_pred.confidence_score:.0f}/100)"
+            )
+
+            target_threshold = next(
+                (low for grade, low, _ in GRADE_BOUNDS if grade == sim_subject.target_grade), None
+            )
+            if target_threshold is not None:
+                scenario_required_exam = required_remaining_exam_average(
+                    sim_subject.test_scores,
+                    sim_subject.remaining_exam_count,
+                    sim_subject.remaining_exam_weights,
+                    target_threshold,
+                    float(scenario_ia),
+                    sim_subject.exam_weight,
+                    sim_subject.ia_weight,
+                )
+                fixed_exam_component = exam_component_from_trajectory(
+                    sim_subject.test_scores,
+                    sim_subject.remaining_exam_count,
+                    sim_subject.remaining_exam_weights,
+                    sim_subject.expected_remaining_exam_avg,
+                )
+                scenario_required_ia = needed_ia_quality_for_target(
+                    target_threshold,
+                    fixed_exam_component,
+                    sim_subject.exam_weight,
+                    sim_subject.ia_weight,
+                )
+                req_exam_text = (
+                    "n/a"
+                    if scenario_required_exam is None
+                    else f"{scenario_required_exam:.1f}% avg on remaining exams"
+                )
+                req_ia_text = "n/a" if scenario_required_ia is None else f"{scenario_required_ia:.1f}% IA"
+                st.caption(
+                    f"Updated target requirements for Grade {sim_subject.target_grade}: "
+                    f"{req_exam_text}; {req_ia_text}."
+                )
+
+            chart_data = scenario_chart_data(subject, float(next_test_score))
+            st.line_chart(chart_data, x="Point", y=["Score history", "Projected path"], height=190)
 
     st.subheader("Grade-target action plans")
     for subject in valid_subjects:
