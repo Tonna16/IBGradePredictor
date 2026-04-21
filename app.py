@@ -1,5 +1,7 @@
 import json
+from datetime import date, datetime
 from dataclasses import asdict, dataclass
+from statistics import pstdev
 from typing import Any, List
 
 import streamlit as st
@@ -20,6 +22,7 @@ GRADE_BOUNDS = [
 class Subject:
     name: str
     test_scores: List[float]
+    assessment_dates: List[str]
     ia_progress_pct: float
     ia_estimated_score: float | None
     exam_weight: float
@@ -38,6 +41,9 @@ class SubjectPrediction:
     trend_label: str
     trend_summary: str
     projected_range: tuple[float, float]
+    confidence_score: float
+    confidence_level: str
+    confidence_summary: str
 
 
 @dataclass
@@ -53,6 +59,7 @@ def default_subject(name: str = "New Subject") -> Subject:
     return Subject(
         name=name,
         test_scores=[72, 68, 75, 80],
+        assessment_dates=[],
         ia_progress_pct=55,
         ia_estimated_score=70,
         exam_weight=0.65,
@@ -142,6 +149,70 @@ def moving_average(values: List[float]) -> float:
     return sum(values) / len(values)
 
 
+def _parse_iso_date(raw: str) -> date | None:
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def parse_dates(raw: str) -> List[str]:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    valid_dates: List[str] = []
+    for p in parts:
+        parsed = _parse_iso_date(p)
+        if parsed is not None:
+            valid_dates.append(parsed.isoformat())
+    return valid_dates
+
+
+def recency_confidence(assessment_dates: List[str]) -> float:
+    if not assessment_dates:
+        return 0.5
+
+    valid = [_parse_iso_date(d) for d in assessment_dates]
+    valid = [d for d in valid if d is not None]
+    if not valid:
+        return 0.5
+
+    latest = max(valid)
+    days_old = max(0, (date.today() - latest).days)
+    if days_old <= 14:
+        return 1.0
+    if days_old <= 45:
+        return 0.75
+    if days_old <= 90:
+        return 0.45
+    return 0.2
+
+
+def confidence_from_evidence(
+    test_scores: List[float], ia_progress_pct: float, assessment_dates: List[str]
+) -> tuple[float, str, str]:
+    test_count = len(test_scores)
+    count_component = min(test_count, 6) / 6 * 35
+
+    volatility = pstdev(test_scores) if len(test_scores) >= 2 else 18.0
+    volatility_component = max(0.0, min(1.0, 1.0 - volatility / 20.0)) * 25
+
+    progress_component = max(0.0, min(100.0, ia_progress_pct)) / 100 * 25
+    recency_component = recency_confidence(assessment_dates) * 15
+
+    score = round(count_component + volatility_component + progress_component + recency_component, 1)
+    if score >= 70:
+        level = "High"
+    elif score >= 45:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    summary = (
+        f"{level} confidence (evidence={test_count} tests, volatility={volatility:.1f}, "
+        f"IA progress={ia_progress_pct:.0f}%)"
+    )
+    return score, level, summary
+
+
 def calculate_trend(scores: List[float], window: int = 3) -> TrendInsight | None:
     if len(scores) < 3:
         return None
@@ -200,6 +271,9 @@ def predict(subject: Subject) -> SubjectPrediction:
     )
     projected_low = projected_exam_low * subject.exam_weight + ia_est * subject.ia_weight
     projected_high = projected_exam_high * subject.exam_weight + ia_est * subject.ia_weight
+    confidence_score, confidence_level, confidence_summary = confidence_from_evidence(
+        subject.test_scores, subject.ia_progress_pct, subject.assessment_dates
+    )
 
     # IB-style weighted composition: IA contribution is not reduced by progress.
     current = exam_avg * subject.exam_weight + ia_est * subject.ia_weight
@@ -233,6 +307,9 @@ def predict(subject: Subject) -> SubjectPrediction:
         trend_label=trend_label,
         trend_summary=trend_summary,
         projected_range=(projected_low, projected_high),
+        confidence_score=confidence_score,
+        confidence_level=confidence_level,
+        confidence_summary=confidence_summary,
     )
 
 
@@ -262,6 +339,11 @@ def subject_from_dict(payload: dict[str, Any]) -> Subject:
     return Subject(
         name=str(payload.get("name", "Imported Subject")),
         test_scores=[float(s) for s in payload.get("test_scores", []) if 0 <= float(s) <= 100],
+        assessment_dates=[
+            str(d)
+            for d in payload.get("assessment_dates", [])
+            if _parse_iso_date(str(d)) is not None
+        ],
         ia_progress_pct=float(payload.get("ia_progress_pct", 0)),
         ia_estimated_score=(
             None
@@ -334,6 +416,12 @@ def main() -> None:
                 key=f"scores_{idx}",
             )
             test_scores = parse_scores(scores_raw)
+            dates_raw = st.text_input(
+                "Assessment dates (optional, comma-separated YYYY-MM-DD)",
+                value=", ".join(subject.assessment_dates),
+                key=f"dates_{idx}",
+            )
+            assessment_dates = parse_dates(dates_raw)
 
             c1, c2, c3 = st.columns(3)
             ia_progress = c1.slider(
@@ -401,6 +489,7 @@ def main() -> None:
                     Subject(
                         name=name,
                         test_scores=test_scores,
+                        assessment_dates=assessment_dates,
                         ia_progress_pct=float(ia_progress),
                         ia_estimated_score=ia_estimated_score,
                         exam_weight=exam_weight,
@@ -422,18 +511,26 @@ def main() -> None:
     summary_rows = []
     for subject in valid_subjects:
         pred = predict(subject)
+        prediction_text = (
+            f"Grade {pred.predicted_grade}, {pred.predicted_final_percentage:.0f}% "
+            f"— {pred.confidence_level} confidence"
+        )
         needed_text = (
             "Already Grade 7"
             if pred.needed_exam_avg_for_next is None
             else f"{pred.needed_exam_avg_for_next:.1f}% exam avg"
         )
+        if pred.confidence_level == "Low" and pred.needed_exam_avg_for_next is not None:
+            needed_text += " (uncertain estimate: gather more recent test evidence)"
         summary_rows.append(
             {
                 "Subject": subject.name,
+                "Prediction": prediction_text,
                 "Current weighted standing": round(pred.current_weighted_standing, 1),
                 "Predicted final %": round(pred.predicted_final_percentage, 1),
                 "Predicted IB grade": pred.predicted_grade,
                 "IA confidence": pred.ia_confidence_label,
+                "Overall confidence": f"{pred.confidence_level} ({pred.confidence_score:.0f}/100)",
                 "Trend": f"{pred.trend_label} ({pred.trend_summary})",
                 "Projection band": f"{pred.projected_range[0]:.1f}%–{pred.projected_range[1]:.1f}%",
                 "Needed for next grade": needed_text,
@@ -441,6 +538,20 @@ def main() -> None:
         )
 
     st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Advice")
+    for subject in valid_subjects:
+        pred = predict(subject)
+        if pred.confidence_level == "Low":
+            advice = (
+                "Low confidence: collect more test evidence (and recent assessments) before "
+                "making high-stakes study decisions."
+            )
+        elif pred.trend_label == "declining":
+            advice = "Performance trend is declining; prioritize revision on weak units this week."
+        else:
+            advice = "Confidence is usable; focus effort on topics with the highest mark gain potential."
+        st.write(f"**{subject.name}:** {advice}")
 
     st.subheader("Priority ranking")
     ranking = []
@@ -476,6 +587,7 @@ def main() -> None:
             - Predicted outcome uses IB-style weighting: exam + final IA estimate.
             - Projection bands adapt conservatively/optimistically from trend slope.
             - IA progress is used only for confidence/risk messaging.
+            - Overall confidence combines evidence volume, volatility, IA progress, and assessment recency.
             - Priority ranking surfaces subjects with the largest climb to the next grade.
             """
         )
