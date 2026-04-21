@@ -719,7 +719,11 @@ def main() -> None:
             )
 
     st.session_state.subjects = updated_subjects
-    valid_subjects = [subject_from_dict(s) for s in st.session_state.subjects if s.test_scores]
+    valid_subjects = [
+        subject_from_dict(s)
+        for s in st.session_state.subjects
+        if isinstance(s, dict) and s.get("test_scores")
+    ]
 
     if not valid_subjects:
         st.info("No valid subjects to predict yet.")
