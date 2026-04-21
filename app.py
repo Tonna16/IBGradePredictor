@@ -35,6 +35,18 @@ class SubjectPrediction:
     needed_exam_avg_for_next: float | None
     needed_ia_for_next: float | None
     ia_confidence_label: str
+    trend_label: str
+    trend_summary: str
+    projected_range: tuple[float, float]
+
+
+@dataclass
+class TrendInsight:
+    label: str
+    numeric_change: float
+    summary: str
+    slope_per_test: float
+    tests_used: int
 
 
 def default_subject(name: str = "New Subject") -> Subject:
@@ -124,9 +136,70 @@ def ia_confidence_from_progress(ia_progress_pct: float) -> str:
     return "High confidence"
 
 
+def moving_average(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def calculate_trend(scores: List[float], window: int = 3) -> TrendInsight | None:
+    if len(scores) < 3:
+        return None
+
+    tests_used = max(3, min(window, len(scores), 5))
+    recent = scores[-tests_used:]
+    pivot = max(1, tests_used // 2)
+    early = recent[:pivot]
+    late = recent[pivot:]
+    if not early or not late:
+        return None
+
+    change = moving_average(late) - moving_average(early)
+    slope = (recent[-1] - recent[0]) / max(1, tests_used - 1)
+
+    if change > 1.5:
+        label = "improving"
+    elif change < -1.5:
+        label = "declining"
+    else:
+        label = "stagnant"
+
+    summary = f"{change:+.1f}% over last {tests_used} tests"
+    return TrendInsight(
+        label=label,
+        numeric_change=change,
+        summary=summary,
+        slope_per_test=slope,
+        tests_used=tests_used,
+    )
+
+
+def projection_band(exam_avg: float, slope_per_test: float, scenario: str) -> tuple[float, float]:
+    adjustments = {"conservative": -0.5, "neutral": 0.0, "optimistic": 0.5}
+    bias = adjustments.get(scenario, 0.0)
+    center = exam_avg + slope_per_test + bias
+    spread = max(1.5, abs(slope_per_test) * 1.25 + 1.0)
+    low = max(0.0, min(100.0, center - spread))
+    high = max(0.0, min(100.0, center + spread))
+    return low, high
+
+
 def predict(subject: Subject) -> SubjectPrediction:
     exam_avg = weighted_average(subject.test_scores)
     ia_est = subject.ia_estimated_score or 0.0
+    trend = calculate_trend(subject.test_scores)
+    trend_label = trend.label if trend is not None else "No trend"
+    trend_summary = (
+        trend.summary if trend is not None else "Need at least 3 tests to classify trend."
+    )
+    scenario = "neutral" if trend is None else ("optimistic" if trend.slope_per_test > 0.3 else "conservative" if trend.slope_per_test < -0.3 else "neutral")
+    projected_exam_low, projected_exam_high = projection_band(
+        exam_avg,
+        0.0 if trend is None else trend.slope_per_test,
+        scenario,
+    )
+    projected_low = projected_exam_low * subject.exam_weight + ia_est * subject.ia_weight
+    projected_high = projected_exam_high * subject.exam_weight + ia_est * subject.ia_weight
 
     # IB-style weighted composition: IA contribution is not reduced by progress.
     current = exam_avg * subject.exam_weight + ia_est * subject.ia_weight
@@ -157,6 +230,9 @@ def predict(subject: Subject) -> SubjectPrediction:
         needed_exam_avg_for_next=needed_exam,
         needed_ia_for_next=needed_ia,
         ia_confidence_label=ia_confidence_from_progress(subject.ia_progress_pct),
+        trend_label=trend_label,
+        trend_summary=trend_summary,
+        projected_range=(projected_low, projected_high),
     )
 
 
@@ -358,6 +434,8 @@ def main() -> None:
                 "Predicted final %": round(pred.predicted_final_percentage, 1),
                 "Predicted IB grade": pred.predicted_grade,
                 "IA confidence": pred.ia_confidence_label,
+                "Trend": f"{pred.trend_label} ({pred.trend_summary})",
+                "Projection band": f"{pred.projected_range[0]:.1f}%–{pred.projected_range[1]:.1f}%",
                 "Needed for next grade": needed_text,
             }
         )
@@ -394,7 +472,9 @@ def main() -> None:
         st.markdown(
             """
             - Recent test scores are weighted slightly more heavily.
+            - Trend analysis compares recent moving averages (3 to 5 tests) to classify momentum.
             - Predicted outcome uses IB-style weighting: exam + final IA estimate.
+            - Projection bands adapt conservatively/optimistically from trend slope.
             - IA progress is used only for confidence/risk messaging.
             - Priority ranking surfaces subjects with the largest climb to the next grade.
             """
