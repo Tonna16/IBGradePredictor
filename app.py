@@ -27,6 +27,10 @@ class Subject:
     ia_estimated_score: float | None
     exam_weight: float
     ia_weight: float
+    remaining_exam_count: int
+    remaining_exam_weights: List[float]
+    expected_remaining_exam_avg: float
+    target_grade: int
 
 
 @dataclass
@@ -64,6 +68,10 @@ def default_subject(name: str = "New Subject") -> Subject:
         ia_estimated_score=70,
         exam_weight=0.65,
         ia_weight=0.35,
+        remaining_exam_count=2,
+        remaining_exam_weights=[],
+        expected_remaining_exam_avg=75,
+        target_grade=6,
     )
 
 
@@ -126,6 +134,19 @@ def parse_scores(raw: str) -> List[float]:
         except ValueError:
             continue
     return scores
+
+
+def parse_weight_list(raw: str) -> List[float]:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    weights: List[float] = []
+    for p in parts:
+        try:
+            val = float(p)
+            if val > 0:
+                weights.append(val)
+        except ValueError:
+            continue
+    return weights
 
 
 def normalize_weights(exam_weight: float, ia_weight: float) -> tuple[float, float]:
@@ -328,6 +349,53 @@ def predict_subject(subject: Subject) -> SubjectPrediction:
     return predict(subject)
 
 
+def required_remaining_exam_average(
+    completed_scores: List[float],
+    remaining_count: int,
+    remaining_weights: List[float],
+    target_score: float,
+    ia_score: float,
+    exam_weight: float,
+    ia_weight: float,
+) -> float | None:
+    if exam_weight <= 0:
+        return None
+
+    done_weights = [1.0] * len(completed_scores)
+    rem_weights = remaining_weights[:remaining_count]
+    if len(rem_weights) < remaining_count:
+        rem_weights.extend([1.0] * (remaining_count - len(rem_weights)))
+
+    sum_done = sum(s * w for s, w in zip(completed_scores, done_weights))
+    weight_done = sum(done_weights)
+    weight_rem = sum(rem_weights)
+    if weight_rem <= 0:
+        return None
+
+    required_exam_component = (target_score - ia_score * ia_weight) / exam_weight
+    needed_total_exam_points = required_exam_component * (weight_done + weight_rem)
+    return (needed_total_exam_points - sum_done) / weight_rem
+
+
+def exam_component_from_trajectory(
+    completed_scores: List[float],
+    remaining_count: int,
+    remaining_weights: List[float],
+    expected_remaining_avg: float,
+) -> float:
+    done_weights = [1.0] * len(completed_scores)
+    rem_weights = remaining_weights[:remaining_count]
+    if len(rem_weights) < remaining_count:
+        rem_weights.extend([1.0] * (remaining_count - len(rem_weights)))
+    sum_done = sum(s * w for s, w in zip(completed_scores, done_weights))
+    weight_done = sum(done_weights)
+    weight_rem = sum(rem_weights)
+    total_weight = weight_done + weight_rem
+    if total_weight <= 0:
+        return 0.0
+    return (sum_done + expected_remaining_avg * weight_rem) / total_weight
+
+
 def subject_to_dict(subject: Subject) -> dict[str, Any]:
     return asdict(subject)
 
@@ -352,6 +420,12 @@ def subject_from_dict(payload: dict[str, Any]) -> Subject:
         ),
         exam_weight=exam_w,
         ia_weight=ia_w,
+        remaining_exam_count=int(payload.get("remaining_exam_count", 2)),
+        remaining_exam_weights=[
+            float(w) for w in payload.get("remaining_exam_weights", []) if float(w) > 0
+        ],
+        expected_remaining_exam_avg=float(payload.get("expected_remaining_exam_avg", 75)),
+        target_grade=max(1, min(7, int(payload.get("target_grade", 6)))),
     )
 
 
@@ -478,6 +552,39 @@ def main() -> None:
             exam_weight, ia_weight = normalize_weights(exam_input, ia_input)
             w3.write(f"Normalized: **Exam {exam_weight:.2f} / IA {ia_weight:.2f}**")
 
+            rem1, rem2 = st.columns([1, 2])
+            remaining_exam_count = rem1.number_input(
+                "Exams left",
+                min_value=0,
+                max_value=12,
+                value=int(subject.remaining_exam_count),
+                step=1,
+                key=f"remaining_count_{idx}",
+            )
+            remaining_weights_raw = rem2.text_input(
+                "Expected weight per remaining exam (optional, comma-separated)",
+                value=", ".join(str(w) for w in subject.remaining_exam_weights),
+                key=f"remaining_weights_{idx}",
+            )
+            remaining_exam_weights = parse_weight_list(remaining_weights_raw)
+
+            t1, t2 = st.columns(2)
+            target_grade = t1.number_input(
+                "Desired IB grade threshold",
+                min_value=1,
+                max_value=7,
+                value=int(subject.target_grade),
+                step=1,
+                key=f"target_grade_{idx}",
+            )
+            expected_remaining_exam_avg = t2.slider(
+                "Expected avg on remaining exams (%)",
+                0,
+                100,
+                int(subject.expected_remaining_exam_avg),
+                key=f"expected_exam_avg_{idx}",
+            )
+
             if st.button("🗑️ Remove subject", key=f"remove_{idx}"):
                 continue
 
@@ -494,6 +601,10 @@ def main() -> None:
                         ia_estimated_score=ia_estimated_score,
                         exam_weight=exam_weight,
                         ia_weight=ia_weight,
+                        remaining_exam_count=int(remaining_exam_count),
+                        remaining_exam_weights=remaining_exam_weights,
+                        expected_remaining_exam_avg=float(expected_remaining_exam_avg),
+                        target_grade=int(target_grade),
                     )
                 )
             )
@@ -538,6 +649,70 @@ def main() -> None:
         )
 
     st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Grade-target action plans")
+    for subject in valid_subjects:
+        st.markdown(f"**{subject.name}**")
+        target_threshold = next(
+            (low for grade, low, _ in GRADE_BOUNDS if grade == subject.target_grade), None
+        )
+        ia_for_calc = subject.ia_estimated_score if subject.ia_estimated_score is not None else 0.0
+        if target_threshold is None:
+            st.write("Invalid target grade.")
+            continue
+
+        required_exam_avg = required_remaining_exam_average(
+            subject.test_scores,
+            subject.remaining_exam_count,
+            subject.remaining_exam_weights,
+            target_threshold,
+            ia_for_calc,
+            subject.exam_weight,
+            subject.ia_weight,
+        )
+
+        fixed_exam_component = exam_component_from_trajectory(
+            subject.test_scores,
+            subject.remaining_exam_count,
+            subject.remaining_exam_weights,
+            subject.expected_remaining_exam_avg,
+        )
+        required_ia = needed_ia_quality_for_target(
+            target_threshold, fixed_exam_component, subject.exam_weight, subject.ia_weight
+        )
+
+        if required_exam_avg is None:
+            st.write("Not enough exam-weight information to compute a required exam average.")
+        elif required_exam_avg > 100:
+            st.error(
+                f"Need {required_exam_avg:.1f}% avg on remaining exams — impossible under current assumptions."
+            )
+        elif required_exam_avg < 0:
+            st.success("Target already secured from current trajectory (required avg is below 0%).")
+        else:
+            st.info(f"Need {required_exam_avg:.1f}% avg on remaining exams.")
+
+        if required_ia is None:
+            st.write("IA path unavailable because IA weight is zero.")
+        else:
+            current_ia = ia_for_calc
+            delta = required_ia - current_ia
+            if required_ia > 100:
+                st.error(
+                    f"With {subject.expected_remaining_exam_avg:.0f}% exam trajectory, required IA is {required_ia:.1f}% (not feasible)."
+                )
+            elif required_ia < 0:
+                st.success(
+                    f"With {subject.expected_remaining_exam_avg:.0f}% exam trajectory, IA requirement is already secured."
+                )
+            elif delta >= 0:
+                st.write(
+                    f"Need +{delta:.1f}% IA (target IA {required_ia:.1f}%) if exam trajectory stays at {subject.expected_remaining_exam_avg:.0f}%."
+                )
+            else:
+                st.write(
+                    f"Can drop {-delta:.1f}% IA (to {required_ia:.1f}%) if exam trajectory stays at {subject.expected_remaining_exam_avg:.0f}%."
+                )
 
     st.subheader("Advice")
     for subject in valid_subjects:
