@@ -1,0 +1,61 @@
+{
+  "timestamp_utc": "2026-04-22T01:21:09.990833+00:00",
+  "dataset_size": 18,
+  "train_size": 13,
+  "holdout_size": 5,
+  "test_size_fraction": 0.3,
+  "seed": 42,
+  "metrics": [
+    {
+      "Model": "Legacy deterministic model",
+      "MAE": 1.646,
+      "RMSE": 1.889
+    },
+    {
+      "Model": "Upgraded statistical model",
+      "MAE": 1.683,
+      "RMSE": 1.926
+    },
+    {
+      "Model": "ML model",
+      "MAE": 3.217,
+      "RMSE": 3.941
+    }
+  ],
+  "calibration": {
+    "is_calibrated": false,
+    "reason": "insufficient_bin_counts",
+    "max_bin_abs_error": null,
+    "mean_bin_abs_error": null,
+    "bin_rows": [
+      {
+        "range": "40-60",
+        "count": 2,
+        "avg_pred": 54.268,
+        "avg_actual": 48.5,
+        "abs_error": 5.768,
+        "is_count_sufficient": false
+      },
+      {
+        "range": "60-80",
+        "count": 2,
+        "avg_pred": 65.708,
+        "avg_actual": 64.0,
+        "abs_error": 1.708,
+        "is_count_sufficient": false
+      },
+      {
+        "range": "80-100",
+        "count": 1,
+        "avg_pred": 83.867,
+        "avg_actual": 85.0,
+        "abs_error": 1.133,
+        "is_count_sufficient": false
+      }
+    ],
+    "bins_evaluated": 0,
+    "min_bin_count": 3,
+    "max_allowed_bin_mae": 8.0
+  },
+  "model_state": "experimental"
+}
