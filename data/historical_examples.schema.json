@@ -4,6 +4,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "schema_version",
     "mean",
     "recent_mean",
     "std",
@@ -14,9 +15,10 @@
     "recency_mean_days",
     "recency_std_days",
     "latest_days_ago",
-    "actual_final_score"
+    "final_percentage"
   ],
   "properties": {
+    "schema_version": {"type": "string", "const": "1.0"},
     "mean": {"type": "number", "minimum": 0, "maximum": 100},
     "recent_mean": {"type": "number", "minimum": 0, "maximum": 100},
     "std": {"type": "number", "minimum": 0},
@@ -27,6 +29,6 @@
     "recency_mean_days": {"type": "number", "minimum": 0},
     "recency_std_days": {"type": "number", "minimum": 0},
     "latest_days_ago": {"type": "number", "minimum": 0},
-    "actual_final_score": {"type": "number", "minimum": 0, "maximum": 100}
+    "final_percentage": {"type": "number", "minimum": 0, "maximum": 100}
   }
 }

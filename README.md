@@ -35,21 +35,30 @@ streamlit run app.py
 
 ==
 
-## Historical evaluation dataset schema
-Use `data/historical_examples.csv` (or JSON) for model evaluation on held-out data.
+## Canonical training/evaluation dataset (versioned, anonymized)
+Use `data/historical_examples.csv` (or JSON) for model evaluation on held-out data and
+`data/anonymized_training_rows.jsonl` for app-exported rows.
 
-Expected columns/keys:
-- `mean`
-- `recent_mean`
-- `std`
-- `slope`
-- `test_count`
-- `ia_estimate`
-- `ia_progress`
-- `recency_mean_days`
-- `recency_std_days`
-- `latest_days_ago`
-- `actual_final_score`
+The canonical row schema is **versioned** and must include:
+- `schema_version` (current: `1.0`)
+- Feature fields:
+  - `mean`
+  - `recent_mean`
+  - `std`
+  - `slope`
+  - `test_count`
+  - `ia_estimate`
+  - `ia_progress`
+  - `recency_mean_days`
+  - `recency_std_days`
+  - `latest_days_ago`
+- Target field:
+  - `final_percentage`
+
+Notes:
+- Keep rows anonymized: no names, IDs, free-text notes, or raw assessment timestamps.
+- Rows with malformed or missing required values are rejected by the loader.
+- Percentage-like features/target are clamped to `0–100` where relevant (`mean`, `recent_mean`, `ia_estimate`, `ia_progress`, `final_percentage`).
 
 JSON schema: `data/historical_examples.schema.json`.
 
