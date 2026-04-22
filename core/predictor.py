@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from math import exp
 from statistics import NormalDist, pstdev
@@ -30,6 +30,10 @@ class Subject:
     remaining_exam_weights: List[float]
     expected_remaining_exam_avg: float
     target_grade: int
+    test_score_obtained: List[float] = field(default_factory=list)
+    test_score_max: List[float] = field(default_factory=list)
+    ia_score_obtained: float | None = None
+    ia_score_max: float | None = None
 
 
 @dataclass
@@ -77,6 +81,22 @@ class RiskAlert:
     title: str
     reason: str
     threshold_text: str
+
+
+def raw_to_pct(score_obtained: float, score_max: float) -> float:
+    if score_max <= 0:
+        raise ValueError("score_max must be greater than zero")
+    if score_obtained < 0:
+        raise ValueError("score_obtained must be non-negative")
+    if score_obtained > score_max:
+        raise ValueError("score_obtained cannot exceed score_max")
+    return (score_obtained / score_max) * 100.0
+
+
+def raw_scores_to_pct(scores_obtained: List[float], scores_max: List[float]) -> List[float]:
+    if len(scores_obtained) != len(scores_max):
+        raise ValueError("scores_obtained and scores_max must have equal lengths")
+    return [raw_to_pct(score, max_score) for score, max_score in zip(scores_obtained, scores_max)]
 
 
 def grade_from_score(score: float) -> int:

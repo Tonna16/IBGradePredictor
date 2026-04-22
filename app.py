@@ -18,6 +18,7 @@ from core.predictor import (
     normalize_weights,
     parse_iso_date,
     predict,
+    raw_to_pct,
     required_remaining_exam_average,
     risk_alerts,
 )
@@ -97,9 +98,10 @@ def prediction_from_percentage(subject: Subject, predicted_percentage: float) ->
 
 
 def default_subject(name: str = "New Subject") -> Subject:
+    default_raw_scores = [72.0, 68.0, 75.0, 80.0]
     return Subject(
         name=name,
-        test_scores=[72, 68, 75, 80],
+        test_scores=default_raw_scores,
         assessment_dates=[],
         ia_progress_pct=55,
         ia_estimated_score=70,
@@ -109,20 +111,21 @@ def default_subject(name: str = "New Subject") -> Subject:
         remaining_exam_weights=[],
         expected_remaining_exam_avg=75,
         target_grade=6,
+        test_score_obtained=default_raw_scores,
+        test_score_max=[100.0] * len(default_raw_scores),
+        ia_score_obtained=70.0,
+        ia_score_max=100.0,
     )
 
 
-def parse_scores(raw: str) -> List[float]:
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    scores: List[float] = []
-    for p in parts:
-        try:
-            val = float(p)
-            if 0 <= val <= 100:
-                scores.append(val)
-        except ValueError:
-            continue
-    return scores
+def _score_rows_for_subject(subject: Subject) -> list[tuple[float, float]]:
+    if subject.test_score_obtained and subject.test_score_max:
+        return [
+            (float(score), float(max_score))
+            for score, max_score in zip(subject.test_score_obtained, subject.test_score_max)
+            if max_score > 0 and 0 <= score <= max_score
+        ]
+    return [(float(score), 100.0) for score in subject.test_scores]
 
 
 def parse_weight_list(raw: str) -> List[float]:
@@ -148,19 +151,31 @@ def parse_dates(raw: str) -> List[str]:
     return valid_dates
 
 
-def scenario_subject(subject: Subject, next_test_score: float, ia_estimate: float) -> Subject:
+def scenario_subject(
+    subject: Subject,
+    next_test_score_obtained: float,
+    next_test_score_max: float,
+    ia_estimate_obtained: float,
+    ia_estimate_max: float,
+) -> Subject:
+    next_test_pct = raw_to_pct(next_test_score_obtained, next_test_score_max)
+    ia_pct = raw_to_pct(ia_estimate_obtained, ia_estimate_max)
     return Subject(
         name=subject.name,
-        test_scores=subject.test_scores + [next_test_score],
+        test_scores=subject.test_scores + [next_test_pct],
         assessment_dates=subject.assessment_dates,
         ia_progress_pct=subject.ia_progress_pct,
-        ia_estimated_score=ia_estimate,
+        ia_estimated_score=ia_pct,
         exam_weight=subject.exam_weight,
         ia_weight=subject.ia_weight,
         remaining_exam_count=subject.remaining_exam_count,
         remaining_exam_weights=subject.remaining_exam_weights,
         expected_remaining_exam_avg=subject.expected_remaining_exam_avg,
         target_grade=subject.target_grade,
+        test_score_obtained=subject.test_score_obtained + [next_test_score_obtained],
+        test_score_max=subject.test_score_max + [next_test_score_max],
+        ia_score_obtained=ia_estimate_obtained,
+        ia_score_max=ia_estimate_max,
     )
 
 
@@ -336,12 +351,42 @@ def main() -> None:
         subject = subject_from_dict(raw_subject)
         with st.expander(f"{idx + 1}. {subject.name}", expanded=True):
             name = st.text_input("Subject name", value=subject.name, key=f"name_{idx}")
-            scores_raw = st.text_input(
-                "Your recent test scores (comma-separated, e.g. 62, 71, 75)",
-                value=", ".join(str(int(s)) if s.is_integer() else f"{s:.1f}" for s in subject.test_scores),
-                key=f"scores_{idx}",
-            )
-            test_scores = parse_scores(scores_raw)
+            st.markdown("**Historical tests/papers (raw score inputs)**")
+            score_rows = _score_rows_for_subject(subject)
+            add_test = st.button("➕ Add test/paper", key=f"add_test_{idx}")
+            remove_last_test = st.button("➖ Remove last test/paper", key=f"remove_test_{idx}")
+            if add_test:
+                score_rows.append((0.0, 100.0))
+            if remove_last_test and score_rows:
+                score_rows = score_rows[:-1]
+
+            score_obtained: list[float] = []
+            score_max: list[float] = []
+            for test_idx, (default_score, default_max) in enumerate(score_rows):
+                row_cols = st.columns([2, 2, 3])
+                test_max = row_cols[1].number_input(
+                    f"Test {test_idx + 1} max",
+                    min_value=0.1,
+                    value=max(0.1, float(default_max)),
+                    step=1.0,
+                    key=f"test_max_{idx}_{test_idx}",
+                )
+                test_score = row_cols[0].number_input(
+                    f"Test {test_idx + 1} score",
+                    min_value=0.0,
+                    max_value=float(test_max),
+                    value=max(0.0, min(float(default_score), float(test_max))),
+                    step=1.0,
+                    key=f"test_score_{idx}_{test_idx}",
+                )
+                row_cols[2].caption(f"Converted: {raw_to_pct(float(test_score), float(test_max)):.1f}%")
+                score_obtained.append(float(test_score))
+                score_max.append(float(test_max))
+
+            test_scores = [
+                raw_to_pct(score, max_score)
+                for score, max_score in zip(score_obtained, score_max)
+            ]
             dates_raw = st.text_input(
                 "Test dates (optional, format YYYY-MM-DD)",
                 value=", ".join(subject.assessment_dates),
@@ -365,24 +410,41 @@ def main() -> None:
 
             if unknown_ia:
                 ia_estimated_score = None
+                ia_score_obtained = None
+                ia_score_max = None
                 c3.number_input(
-                    "Estimated IA score (%)",
+                    "Estimated IA raw score",
                     min_value=0.0,
-                    max_value=100.0,
                     value=0.0,
                     disabled=True,
                     key=f"ia_est_{idx}",
                 )
             else:
-                default_ia = 70.0 if subject.ia_estimated_score is None else float(subject.ia_estimated_score)
-                ia_estimated_score = c3.number_input(
-                    "Estimated IA score (%)",
+                default_ia_score = (
+                    70.0
+                    if subject.ia_score_obtained is None
+                    else float(subject.ia_score_obtained)
+                )
+                default_ia_max = 100.0 if subject.ia_score_max is None else float(subject.ia_score_max)
+                ia_max_input = c2.number_input(
+                    "IA component max",
+                    min_value=0.1,
+                    value=max(0.1, default_ia_max),
+                    step=1.0,
+                    key=f"ia_max_{idx}",
+                )
+                ia_score_input = c3.number_input(
+                    "Estimated IA raw score",
                     min_value=0.0,
-                    max_value=100.0,
-                    value=default_ia,
+                    max_value=float(ia_max_input),
+                    value=max(0.0, min(default_ia_score, float(ia_max_input))),
                     step=1.0,
                     key=f"ia_est_{idx}",
                 )
+                ia_score_obtained = float(ia_score_input)
+                ia_score_max = float(ia_max_input)
+                ia_estimated_score = raw_to_pct(ia_score_obtained, ia_score_max)
+                c1.caption(f"IA estimate converts to {ia_estimated_score:.1f}%")
 
             w1, w2, w3 = st.columns([1, 1, 1])
             exam_input = w1.number_input(
@@ -457,7 +519,7 @@ def main() -> None:
                 continue
 
             if not test_scores:
-                st.warning("Add at least one score between 0 and 100.")
+                st.warning("Add at least one historical test/paper score.")
 
             updated_subjects.append(
                 subject_to_dict(
@@ -473,6 +535,10 @@ def main() -> None:
                         remaining_exam_weights=remaining_exam_weights,
                         expected_remaining_exam_avg=float(expected_remaining_exam_avg),
                         target_grade=int(target_grade),
+                        test_score_obtained=score_obtained,
+                        test_score_max=score_max,
+                        ia_score_obtained=ia_score_obtained,
+                        ia_score_max=ia_score_max,
                     )
                 )
             )
@@ -609,28 +675,61 @@ def main() -> None:
                 st.success("No immediate risk flags right now.")
 
             sc1, sc2 = st.columns(2)
-            next_test_default = int(round(subject.expected_remaining_exam_avg))
-            next_test_score = sc1.slider(
-                "What if your next test score is:",
-                0,
-                100,
-                max(0, min(100, next_test_default)),
-                key=f"scenario_next_test_{idx}",
+            next_test_default_raw = (
+                float(subject.test_score_obtained[-1])
+                if subject.test_score_obtained
+                else float(subject.expected_remaining_exam_avg)
             )
-            scenario_ia_default = (
-                int(round(subject.ia_estimated_score))
-                if subject.ia_estimated_score is not None
-                else 70
+            next_test_default_max = (
+                float(subject.test_score_max[-1])
+                if subject.test_score_max
+                else 100.0
             )
-            scenario_ia = sc2.slider(
-                "What if your IA estimate becomes:",
-                0,
-                100,
-                max(0, min(100, scenario_ia_default)),
-                key=f"scenario_ia_{idx}",
+            next_test_max = sc1.number_input(
+                "Scenario next test max",
+                min_value=0.1,
+                value=max(0.1, next_test_default_max),
+                step=1.0,
+                key=f"scenario_next_test_max_{idx}",
+            )
+            next_test_score = sc1.number_input(
+                "Scenario next test score",
+                min_value=0.0,
+                max_value=float(next_test_max),
+                value=max(0.0, min(next_test_default_raw, float(next_test_max))),
+                step=1.0,
+                key=f"scenario_next_test_score_{idx}",
             )
 
-            sim_subject = scenario_subject(subject, float(next_test_score), float(scenario_ia))
+            scenario_ia_default_raw = (
+                float(subject.ia_score_obtained) if subject.ia_score_obtained is not None else 70.0
+            )
+            scenario_ia_default_max = (
+                float(subject.ia_score_max) if subject.ia_score_max is not None else 100.0
+            )
+            scenario_ia_max = sc2.number_input(
+                "Scenario IA max",
+                min_value=0.1,
+                value=max(0.1, scenario_ia_default_max),
+                step=1.0,
+                key=f"scenario_ia_max_{idx}",
+            )
+            scenario_ia = sc2.number_input(
+                "Scenario IA score",
+                min_value=0.0,
+                max_value=float(scenario_ia_max),
+                value=max(0.0, min(scenario_ia_default_raw, float(scenario_ia_max))),
+                step=1.0,
+                key=f"scenario_ia_score_{idx}",
+            )
+
+            sim_subject = scenario_subject(
+                subject,
+                float(next_test_score),
+                float(next_test_max),
+                float(scenario_ia),
+                float(scenario_ia_max),
+            )
             sim_pred = predict(sim_subject)
             sim_ci_pct = f"{sim_pred.ci_confidence_level * 100:.0f}%"
             st.info(
@@ -649,7 +748,7 @@ def main() -> None:
                     sim_subject.remaining_exam_count,
                     sim_subject.remaining_exam_weights,
                     target_threshold,
-                    float(scenario_ia),
+                    0.0 if sim_subject.ia_estimated_score is None else float(sim_subject.ia_estimated_score),
                     sim_subject.exam_weight,
                     sim_subject.ia_weight,
                 )
@@ -676,7 +775,10 @@ def main() -> None:
                     f"{req_exam_text}; {req_ia_text}."
                 )
 
-            chart_data = scenario_chart_data(subject, float(next_test_score))
+            chart_data = scenario_chart_data(
+                subject,
+                raw_to_pct(float(next_test_score), float(next_test_max)),
+            )
             st.line_chart(chart_data, x="Point", y=["Score history", "Projected path"], height=190)
 
     st.subheader("Action plan for your target grades")
