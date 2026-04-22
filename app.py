@@ -1,4 +1,6 @@
 import json
+import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List
 
@@ -29,6 +31,57 @@ from ml.forecaster import (
 from ml.evaluate import DATASET_SCHEMA_VERSION, TARGET_SCORE_KEY, load_historical_examples
 
 TRAINING_LOG_PATH = Path("data/anonymized_training_rows.jsonl")
+ML_GUARDRAIL_LOG_PATH = Path("data/ml_guardrail_rejections.jsonl")
+ML_PERCENTAGE_MIN = 0.0
+ML_PERCENTAGE_MAX = 100.0
+ML_MAX_ABS_DELTA = 25.0
+ML_HIGH_CONFIDENCE_ALLOW_OVERRULE_SCORE = 80.0
+
+
+def log_ml_guardrail_rejection(
+    subject: Subject,
+    deterministic_pred: SubjectPrediction,
+    ml_percentage: float | None,
+    reason: str,
+    path: Path = ML_GUARDRAIL_LOG_PATH,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "subject": subject.name,
+        "reason": reason,
+        "deterministic_percentage": round(deterministic_pred.predicted_final_percentage, 3),
+        "deterministic_confidence_score": round(deterministic_pred.confidence_score, 3),
+        "ml_percentage": None if ml_percentage is None else round(float(ml_percentage), 3),
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def should_use_ml_prediction(
+    subject: Subject,
+    deterministic_pred: SubjectPrediction,
+    ml_percentage: float | None,
+) -> tuple[bool, str]:
+    del subject  # reserved for future subject-level guardrails
+    if ml_percentage is None:
+        return False, "ml_none"
+    try:
+        ml_value = float(ml_percentage)
+    except (TypeError, ValueError):
+        return False, "ml_non_numeric"
+    if math.isnan(ml_value):
+        return False, "ml_nan"
+    if ml_value < ML_PERCENTAGE_MIN or ml_value > ML_PERCENTAGE_MAX:
+        return False, "ml_out_of_range"
+
+    abs_delta = abs(deterministic_pred.predicted_final_percentage - ml_value)
+    if (
+        abs_delta > ML_MAX_ABS_DELTA
+        and deterministic_pred.confidence_score < ML_HIGH_CONFIDENCE_ALLOW_OVERRULE_SCORE
+    ):
+        return False, f"delta_{abs_delta:.1f}_over_{ML_MAX_ABS_DELTA:.1f}"
+    return True, "accepted"
 
 
 def prediction_from_percentage(subject: Subject, predicted_percentage: float) -> SubjectPrediction:
@@ -482,18 +535,23 @@ def main() -> None:
     for subject in valid_subjects:
         deterministic_pred = predict(subject)
         ml_percentage: float | None = None
+        ml_value: float | None = None
         if ml_runtime["source"] == "artifact":
             ml_percentage = predict_with_bundle(ml_runtime["bundle"], build_features(subject))
         elif ml_runtime["source"] == "historical_examples":
             ml_percentage = predict_with_bundle(ml_runtime["bundle"], build_features(subject))
-        ml_pred = (
-            prediction_from_percentage(subject, ml_percentage)
-            if ml_percentage is not None
-            else deterministic_pred
-        )
+        if ml_percentage is not None:
+            try:
+                ml_value = float(ml_percentage)
+            except (TypeError, ValueError):
+                ml_value = None
+        ml_allowed, ml_guardrail_reason = should_use_ml_prediction(subject, deterministic_pred, ml_percentage)
+        if not ml_allowed:
+            log_ml_guardrail_rejection(subject, deterministic_pred, ml_percentage, ml_guardrail_reason)
+        ml_pred = prediction_from_percentage(subject, ml_percentage) if ml_allowed else deterministic_pred
         pred = deterministic_pred if mode == "Quick estimate" else ml_pred
         if mode == "Side-by-side comparison":
-            pred = ml_pred if ml_percentage is not None else deterministic_pred
+            pred = ml_pred if ml_allowed else deterministic_pred
 
         selected_predictions[subject.name] = pred
         ci_pct = f"{pred.ci_confidence_level * 100:.0f}%"
@@ -526,13 +584,15 @@ def main() -> None:
         )
         if mode == "Side-by-side comparison":
             summary_rows[-1]["Deterministic %"] = round(deterministic_pred.predicted_final_percentage, 1)
-            summary_rows[-1]["ML %"] = round(ml_pred.predicted_final_percentage, 1)
+            summary_rows[-1]["ML %"] = round(ml_value, 1) if ml_value is not None and not math.isnan(ml_value) else "n/a"
             summary_rows[-1]["|Δ|"] = round(
-                abs(deterministic_pred.predicted_final_percentage - ml_pred.predicted_final_percentage),
+                abs(deterministic_pred.predicted_final_percentage - ml_value),
                 2,
-            )
+            ) if ml_value is not None and not math.isnan(ml_value) else "n/a"
+            summary_rows[-1]["Fallback reason"] = "none" if ml_allowed else ml_guardrail_reason
+            summary_rows[-1]["ML status"] = "active" if ml_allowed else "rejected_by_guardrail"
         elif mode == "Data-learned estimate":
-            summary_rows[-1]["ML status"] = "active" if ml_percentage is not None else "not available (using quick estimate)"
+            summary_rows[-1]["ML status"] = "active" if ml_allowed else "rejected_by_guardrail"
 
     st.dataframe(summary_rows, use_container_width=True, hide_index=True)
 
