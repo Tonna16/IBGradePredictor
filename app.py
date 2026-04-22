@@ -19,7 +19,9 @@ from core.predictor import (
     risk_alerts,
 )
 from ml.forecaster import build_features, predict_with_model
-from ml.evaluate import evaluate_models, load_historical_examples
+from ml.evaluate import DATASET_SCHEMA_VERSION, TARGET_SCORE_KEY, evaluate_models, load_historical_examples
+
+TRAINING_LOG_PATH = Path("data/anonymized_training_rows.jsonl")
 
 
 def prediction_from_percentage(subject: Subject, predicted_percentage: float) -> SubjectPrediction:
@@ -118,6 +120,23 @@ def scenario_chart_data(subject: Subject, next_test_score: float) -> dict[str, l
         else [float("nan")] * len(labels)
     )
     return {"Point": labels, "Score history": history, "Projected path": projected_path}
+
+
+def build_anonymized_training_row(subject: Subject, final_percentage: float) -> dict[str, float | str]:
+    features = build_features(subject)
+    row: dict[str, float | str] = {"schema_version": DATASET_SCHEMA_VERSION}
+    row.update({key: float(features.get(key, 0.0)) for key in features})
+    row[TARGET_SCORE_KEY] = max(0.0, min(100.0, float(final_percentage)))
+    return row
+
+
+def append_training_rows(rows: list[dict[str, float | str]], path: Path = TRAINING_LOG_PATH) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
 
 
 def init_state() -> None:
@@ -275,6 +294,22 @@ def main() -> None:
                 int(subject.expected_remaining_exam_avg),
                 key=f"expected_exam_avg_{idx}",
             )
+            final_known = st.checkbox(
+                "Final percentage known (for anonymized training export)",
+                value=raw_subject.get("final_percentage") is not None,
+                key=f"final_known_{idx}",
+            )
+            if final_known:
+                final_percentage = st.number_input(
+                    "Observed final percentage (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(raw_subject.get("final_percentage", 70.0)),
+                    step=1.0,
+                    key=f"final_percentage_{idx}",
+                )
+            else:
+                final_percentage = None
 
             if st.button("🗑️ Remove subject", key=f"remove_{idx}"):
                 continue
@@ -299,6 +334,8 @@ def main() -> None:
                     )
                 )
             )
+            if final_percentage is not None:
+                updated_subjects[-1]["final_percentage"] = float(final_percentage)
 
     st.session_state.subjects = updated_subjects
     valid_subjects = [
@@ -330,6 +367,24 @@ def main() -> None:
             "No historical evidence table available yet. "
             "Add at least 4 examples to data/historical_examples.csv or data/historical_examples.json."
         )
+    exportable_rows = []
+    for raw_subject in st.session_state.subjects:
+        if not isinstance(raw_subject, dict) or raw_subject.get("final_percentage") is None:
+            continue
+        subject = subject_from_dict(raw_subject)
+        if not subject.test_scores:
+            continue
+        exportable_rows.append(build_anonymized_training_row(subject, float(raw_subject["final_percentage"])))
+
+    st.caption(
+        "Training exporter logs anonymized rows (features + final_percentage) with no names or raw dates."
+    )
+    export_disabled = not exportable_rows
+    if st.button("🧾 Log anonymized training rows", disabled=export_disabled):
+        append_training_rows(exportable_rows)
+        st.success(f"Logged {len(exportable_rows)} row(s) to `{TRAINING_LOG_PATH}`.")
+    if export_disabled:
+        st.info("Set at least one 'Observed final percentage' to enable training-row export.")
 
     st.markdown("---")
     st.subheader("Per-subject forecast")

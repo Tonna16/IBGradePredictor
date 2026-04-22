@@ -10,7 +10,8 @@
     "recency_mean_days": 11,
     "recency_std_days": 3,
     "latest_days_ago": 7,
-    "actual_final_score": 66
+    "final_percentage": 66,
+    "schema_version": "1.0"
   },
   {
     "mean": 74,
@@ -23,6 +24,7 @@
     "recency_mean_days": 9,
     "recency_std_days": 4,
     "latest_days_ago": 5,
-    "actual_final_score": 78
+    "final_percentage": 78,
+    "schema_version": "1.0"
   }
 ]

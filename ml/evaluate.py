@@ -11,7 +11,9 @@ from pathlib import Path
 from core.predictor import LEGACY_EXAM_SIGNAL_CONFIG, Subject, predict
 from ml.forecaster import FEATURE_KEYS, predict_with_bundle, train_models_from_feature_rows
 
-ACTUAL_SCORE_KEY = "actual_final_score"
+DATASET_SCHEMA_VERSION = "1.0"
+TARGET_SCORE_KEY = "final_percentage"
+RANGED_FEATURE_KEYS = {"mean", "recent_mean", "ia_estimate", "ia_progress"}
 
 
 @dataclass
@@ -31,6 +33,44 @@ def _clamp_score(score: float) -> float:
     return max(0.0, min(100.0, score))
 
 
+def _coerce_required_number(row: dict[str, object], key: str) -> float | None:
+    if key not in row:
+        return None
+    value = row.get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_and_parse_row(row: object) -> HistoricalExample | None:
+    if not isinstance(row, dict):
+        return None
+
+    schema_version = str(row.get("schema_version", DATASET_SCHEMA_VERSION))
+    if schema_version != DATASET_SCHEMA_VERSION:
+        return None
+
+    features: dict[str, float] = {}
+    for key in FEATURE_KEYS:
+        value = _coerce_required_number(row, key)
+        if value is None:
+            return None
+        if key in RANGED_FEATURE_KEYS:
+            value = _clamp_score(value)
+        elif key in {"std", "recency_mean_days", "recency_std_days", "latest_days_ago"}:
+            value = max(0.0, value)
+        elif key == "test_count":
+            if value < 1:
+                return None
+        features[key] = value
+
+    target_value = _coerce_required_number(row, TARGET_SCORE_KEY)
+    if target_value is None:
+        return None
+    return HistoricalExample(features=features, actual_final_score=_clamp_score(target_value))
+
+
 def load_historical_examples(path: Path) -> list[HistoricalExample]:
     if not path.exists():
         return []
@@ -43,9 +83,10 @@ def load_historical_examples(path: Path) -> list[HistoricalExample]:
 
     examples: list[HistoricalExample] = []
     for row in rows:
-        features = {key: _to_float((row or {}).get(key, 0.0)) for key in FEATURE_KEYS}
-        actual = _clamp_score(_to_float((row or {}).get(ACTUAL_SCORE_KEY, 0.0)))
-        examples.append(HistoricalExample(features=features, actual_final_score=actual))
+        parsed = _validate_and_parse_row(row)
+        if parsed is None:
+            continue
+        examples.append(parsed)
     return examples
 
 
