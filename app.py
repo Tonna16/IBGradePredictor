@@ -148,10 +148,16 @@ def build_plan_pdf(subjects: list[Subject]) -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+    usable_width = pdf.w - pdf.l_margin - pdf.r_margin
+
+    def write_line(height: float, text: str) -> None:
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(usable_width, height, _clean_pdf_text(text))
+
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, _clean_pdf_text("IB Study Plan Summary"), ln=True)
+    write_line(10, "IB Study Plan Summary")
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 8, _clean_pdf_text("Friendly overview of where you stand and what to focus on next."), ln=True)
+    write_line(8, "Friendly overview of where you stand and what to focus on next.")
     pdf.ln(2)
 
     for idx, subject in enumerate(subjects, start=1):
@@ -165,18 +171,17 @@ def build_plan_pdf(subjects: list[Subject]) -> bytes:
         scores_text = ", ".join(f"{score:.0f}%" for score in subject.test_scores) if subject.test_scores else "No scores yet"
 
         pdf.set_font("Helvetica", "B", 14)
-        pdf.multi_cell(0, 8, _clean_pdf_text(f"{idx}. {subject.name}"))
+        write_line(8, f"{idx}. {subject.name}")
         pdf.set_font("Helvetica", "", 11)
-        pdf.multi_cell(
-            0,
+        write_line(
             7,
-            _clean_pdf_text(
+            (
                 f"Current forecast: Grade {pred.predicted_grade} ({pred.predicted_final_percentage:.1f}%). "
                 f"Confidence: {pred.confidence_level}."
             ),
         )
-        pdf.multi_cell(0, 7, _clean_pdf_text(f"Recent scores: {scores_text}."))
-        pdf.multi_cell(0, 7, _clean_pdf_text(f"Target: Grade {subject.target_grade}. {target_text}"))
+        write_line(7, f"Recent scores: {scores_text}.")
+        write_line(7, f"Target: Grade {subject.target_grade}. {target_text}")
         pdf.ln(1)
 
     return bytes(pdf.output(dest="S"))
