@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from math import exp
-from statistics import pstdev
+from statistics import NormalDist, pstdev
 from typing import List
 
 GRADE_BOUNDS = [
@@ -47,6 +47,9 @@ class SubjectPrediction:
     confidence_score: float
     confidence_level: str
     confidence_summary: str
+    ci_low: float
+    ci_high: float
+    ci_confidence_level: float
 
 
 @dataclass(frozen=True)
@@ -340,6 +343,27 @@ def projection_band(
     return low, high
 
 
+def z_based_confidence_interval(
+    scores: List[float],
+    predicted_final_percentage: float,
+    exam_weight: float,
+    *,
+    confidence_level: float = 0.95,
+) -> tuple[float, float, float]:
+    clamped_confidence = min(0.999, max(0.50, confidence_level))
+    z_score = NormalDist().inv_cdf((1.0 + clamped_confidence) / 2.0)
+
+    sample_size = max(1, len(scores))
+    observed_std = pstdev(scores) if len(scores) >= 2 else 12.0
+    std_error = observed_std / (sample_size**0.5)
+    final_percentage_std_error = std_error * max(0.0, exam_weight)
+
+    margin = z_score * final_percentage_std_error
+    ci_low = max(0.0, min(100.0, predicted_final_percentage - margin))
+    ci_high = max(0.0, min(100.0, predicted_final_percentage + margin))
+    return ci_low, ci_high, clamped_confidence
+
+
 def predict(subject: Subject, signal_config: ExamSignalConfig = UPGRADED_EXAM_SIGNAL_CONFIG) -> SubjectPrediction:
     use_legacy_fallback = len(subject.test_scores) < 3
     active_config = LEGACY_EXAM_SIGNAL_CONFIG if use_legacy_fallback else signal_config
@@ -373,6 +397,11 @@ def predict(subject: Subject, signal_config: ExamSignalConfig = UPGRADED_EXAM_SI
 
     predicted_final = exam_avg * subject.exam_weight + ia_est * subject.ia_weight
     predicted_final = max(0.0, min(100.0, predicted_final))
+    ci_low, ci_high, ci_confidence_level = z_based_confidence_interval(
+        subject.test_scores,
+        predicted_final,
+        subject.exam_weight,
+    )
     grade = grade_from_score(predicted_final)
 
     next_threshold = next_grade_threshold(grade)
@@ -402,6 +431,9 @@ def predict(subject: Subject, signal_config: ExamSignalConfig = UPGRADED_EXAM_SI
         confidence_score=confidence_score,
         confidence_level=confidence_level,
         confidence_summary=confidence_summary,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        ci_confidence_level=ci_confidence_level,
     )
 
 
@@ -467,6 +499,25 @@ def risk_alerts(subject: Subject, prediction: SubjectPrediction) -> List[RiskAle
                 title="Forecast confidence is low",
                 reason=prediction.confidence_summary,
                 threshold_text="Threshold check: confidence score < 45",
+            )
+        )
+
+    next_threshold = next_grade_threshold(prediction.predicted_grade)
+    if (
+        next_threshold is not None
+        and prediction.ci_low <= next_threshold <= prediction.ci_high
+    ):
+        alerts.append(
+            RiskAlert(
+                title="Next-grade threshold sits inside forecast interval",
+                reason=(
+                    f"The {prediction.ci_confidence_level:.0%} interval is "
+                    f"{prediction.ci_low:.1f}%–{prediction.ci_high:.1f}%, and the next grade "
+                    f"threshold ({next_threshold:.1f}%) lies inside that range."
+                ),
+                threshold_text=(
+                    "Threshold check: ci_low ≤ next_grade_threshold ≤ ci_high"
+                ),
             )
         )
 
