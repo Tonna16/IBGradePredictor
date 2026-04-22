@@ -37,6 +37,34 @@ ML_PERCENTAGE_MIN = 0.0
 ML_PERCENTAGE_MAX = 100.0
 ML_MAX_ABS_DELTA = 25.0
 ML_HIGH_CONFIDENCE_ALLOW_OVERRULE_SCORE = 80.0
+MIN_VALIDATED_ROWS_FOR_ML = 20
+EVAL_SUMMARY_PATH = Path("data/latest_evaluation_summary.json")
+
+
+def load_latest_evaluation_summary(path: Path = EVAL_SUMMARY_PATH) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def latest_ml_metric(summary: dict[str, Any] | None, metric: str) -> float | None:
+    if not summary:
+        return None
+    metrics = summary.get("metrics")
+    if not isinstance(metrics, list):
+        return None
+    for row in metrics:
+        if isinstance(row, dict) and row.get("Model") == "ML model":
+            value = row.get(metric)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def log_ml_guardrail_rejection(
@@ -263,11 +291,39 @@ def build_plan_pdf(subjects: list[Subject]) -> bytes:
 
 def model_options(subjects: list[Subject]) -> tuple[dict[str, Any], bool]:
     load_result = load_model_bundle() if subjects else None
-    if load_result is not None and load_result.status == ArtifactLoadStatus.VALID:
-        return {"source": "artifact", "bundle": load_result.bundle, "status_badge": "artifact_valid"}, True
+    eval_summary = load_latest_evaluation_summary()
+    model_state = "experimental"
+    if isinstance(eval_summary, dict):
+        summary_state = eval_summary.get("model_state")
+        if summary_state in {"ready", "experimental"}:
+            model_state = summary_state
 
     examples = load_historical_examples(Path("data/historical_examples.csv"))
-    if len(examples) >= 4:
+    validated_row_count = len(examples)
+    if validated_row_count < MIN_VALIDATED_ROWS_FOR_ML:
+        return {
+            "source": "deterministic_fallback",
+            "bundle": None,
+            "status_badge": "insufficient_training_rows",
+            "artifact_reason": None if load_result is None else load_result.reason,
+            "validated_row_count": validated_row_count,
+            "min_rows_required": MIN_VALIDATED_ROWS_FOR_ML,
+            "model_state": "experimental",
+            "evaluation_summary": eval_summary,
+        }, False
+
+    if load_result is not None and load_result.status == ArtifactLoadStatus.VALID:
+        return {
+            "source": "artifact",
+            "bundle": load_result.bundle,
+            "status_badge": "artifact_valid",
+            "validated_row_count": validated_row_count,
+            "min_rows_required": MIN_VALIDATED_ROWS_FOR_ML,
+            "model_state": model_state,
+            "evaluation_summary": eval_summary,
+        }, True
+
+    if validated_row_count >= 4:
         bundle = train_models_from_feature_rows(
             [ex.features for ex in examples],
             [ex.actual_final_score for ex in examples],
@@ -279,8 +335,20 @@ def model_options(subjects: list[Subject]) -> tuple[dict[str, Any], bool]:
                     "bundle": bundle,
                     "status_badge": "historical_bundle",
                     "artifact_reason": load_result.reason,
+                    "validated_row_count": validated_row_count,
+                    "min_rows_required": MIN_VALIDATED_ROWS_FOR_ML,
+                    "model_state": model_state,
+                    "evaluation_summary": eval_summary,
                 }, True
-            return {"source": "historical_examples", "bundle": bundle, "status_badge": "historical_bundle"}, True
+            return {
+                "source": "historical_examples",
+                "bundle": bundle,
+                "status_badge": "historical_bundle",
+                "validated_row_count": validated_row_count,
+                "min_rows_required": MIN_VALIDATED_ROWS_FOR_ML,
+                "model_state": model_state,
+                "evaluation_summary": eval_summary,
+            }, True
 
     status_badge = "fallback_only"
     artifact_reason = None
@@ -293,6 +361,10 @@ def model_options(subjects: list[Subject]) -> tuple[dict[str, Any], bool]:
         "bundle": None,
         "status_badge": status_badge,
         "artifact_reason": artifact_reason,
+        "validated_row_count": validated_row_count,
+        "min_rows_required": MIN_VALIDATED_ROWS_FOR_ML,
+        "model_state": model_state,
+        "evaluation_summary": eval_summary,
     }, False
 
 
@@ -564,10 +636,35 @@ def main() -> None:
     )
     ml_runtime, ml_available = model_options(valid_subjects)
     st.caption(f"ML status badge: `{ml_runtime.get('status_badge', 'fallback_only')}`")
+    eval_summary = ml_runtime.get("evaluation_summary")
+    if isinstance(eval_summary, dict):
+        eval_dataset = eval_summary.get("dataset_size", "n/a")
+        eval_mae = latest_ml_metric(eval_summary, "MAE")
+        eval_rmse = latest_ml_metric(eval_summary, "RMSE")
+        eval_ts = eval_summary.get("timestamp_utc", "unknown")
+        state = eval_summary.get("model_state", ml_runtime.get("model_state", "experimental"))
+        st.caption(
+            "Latest evaluation summary: "
+            f"rows={eval_dataset}, MAE={eval_mae if eval_mae is not None else 'n/a'}, "
+            f"RMSE={eval_rmse if eval_rmse is not None else 'n/a'}, "
+            f"model_state={state}, timestamp={eval_ts}"
+        )
+
+    if ml_runtime.get("status_badge") == "insufficient_training_rows":
+        st.warning(
+            "ML mode disabled: need at least "
+            f"{ml_runtime.get('min_rows_required', MIN_VALIDATED_ROWS_FOR_ML)} validated rows "
+            f"(found {ml_runtime.get('validated_row_count', 0)})."
+        )
     if ml_runtime.get("status_badge") == "artifact_incompatible":
         st.warning(
             "Saved ML artifact is incompatible with this app version. "
             "Falling back to deterministic estimates unless retraining data is available."
+        )
+    if ml_runtime.get("model_state") == "experimental":
+        st.warning(
+            "Model is currently marked experimental because calibration checks are missing or out of range. "
+            "Treat ML forecasts as directional guidance only."
         )
     if ml_runtime.get("artifact_reason"):
         st.caption(f"Artifact compatibility reason: `{ml_runtime['artifact_reason']}`")

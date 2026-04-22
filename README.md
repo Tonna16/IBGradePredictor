@@ -24,7 +24,12 @@ The combined score is mapped to IB-style grade boundaries:
 - 35-44 → 2
 - 0-34 → 1
 
-==
+## Reliability and interpretation
+- Forecasts are **probabilistic guidance**, not guaranteed exact outcomes.
+- Expected error should be monitored with holdout checks; practical targets are usually **single-digit MAE** and low-double-digit RMSE, depending on dataset quality.
+- If calibration checks fail (predicted score bands do not match observed outcomes), the model is marked `experimental` in the app.
+- ML mode is only enabled after a minimum number of validated historical rows is available.
+
 ## Run locally
 ```bash
 python -m venv .venv
@@ -32,8 +37,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-==
 
 ## Canonical training/evaluation dataset (versioned, anonymized)
 Use `data/historical_examples.csv` (or JSON) for model evaluation on held-out data and
@@ -66,3 +69,23 @@ Run evaluation:
 ```bash
 python -m ml.evaluate --data data/historical_examples.csv
 ```
+
+### Periodic holdout monitoring workflow (MAE/RMSE + calibration)
+Use this on a schedule (e.g., weekly cron or CI job) to refresh reliability metrics from fresh validated rows.
+
+```bash
+python -m ml.evaluate \
+  --data data/historical_examples.csv \
+  --test-size 0.3 \
+  --seed 42 \
+  --summary-out data/latest_evaluation_summary.json \
+  --calibration-bins 5 \
+  --min-calibration-bin-count 3 \
+  --max-calibration-bin-mae 8.0
+```
+
+The app reads `data/latest_evaluation_summary.json` at startup/admin view and shows:
+- dataset size
+- latest MAE and RMSE
+- model evaluation timestamp
+- model state (`ready` or `experimental`)
