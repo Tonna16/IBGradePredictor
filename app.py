@@ -19,7 +19,13 @@ from core.predictor import (
     required_remaining_exam_average,
     risk_alerts,
 )
-from ml.forecaster import build_features, predict_with_bundle, predict_with_model, train_models_from_feature_rows
+from ml.forecaster import (
+    ArtifactLoadStatus,
+    build_features,
+    load_model_bundle,
+    predict_with_bundle,
+    train_models_from_feature_rows,
+)
 from ml.evaluate import DATASET_SCHEMA_VERSION, TARGET_SCORE_KEY, load_historical_examples
 
 TRAINING_LOG_PATH = Path("data/anonymized_training_rows.jsonl")
@@ -188,9 +194,9 @@ def build_plan_pdf(subjects: list[Subject]) -> bytes:
 
 
 def model_options(subjects: list[Subject]) -> tuple[dict[str, Any], bool]:
-    artifact_loaded = predict_with_model(build_features(subjects[0])) is not None if subjects else False
-    if artifact_loaded:
-        return {"source": "artifact", "bundle": None}, True
+    load_result = load_model_bundle() if subjects else None
+    if load_result is not None and load_result.status == ArtifactLoadStatus.VALID:
+        return {"source": "artifact", "bundle": load_result.bundle, "status_badge": "artifact_valid"}, True
 
     examples = load_historical_examples(Path("data/historical_examples.csv"))
     if len(examples) >= 4:
@@ -199,9 +205,27 @@ def model_options(subjects: list[Subject]) -> tuple[dict[str, Any], bool]:
             [ex.actual_final_score for ex in examples],
         )
         if bundle is not None:
-            return {"source": "historical_examples", "bundle": bundle}, True
+            if load_result is not None and load_result.status == ArtifactLoadStatus.INCOMPATIBLE:
+                return {
+                    "source": "historical_examples",
+                    "bundle": bundle,
+                    "status_badge": "historical_bundle",
+                    "artifact_reason": load_result.reason,
+                }, True
+            return {"source": "historical_examples", "bundle": bundle, "status_badge": "historical_bundle"}, True
 
-    return {"source": "deterministic_fallback", "bundle": None}, False
+    status_badge = "fallback_only"
+    artifact_reason = None
+    if load_result is not None and load_result.status == ArtifactLoadStatus.INCOMPATIBLE:
+        status_badge = "artifact_incompatible"
+        artifact_reason = load_result.reason
+
+    return {
+        "source": "deterministic_fallback",
+        "bundle": None,
+        "status_badge": status_badge,
+        "artifact_reason": artifact_reason,
+    }, False
 
 
 def init_state() -> None:
@@ -420,6 +444,17 @@ def main() -> None:
         help="Quick estimate uses the rules-based model. Data-learned estimate uses ML when available.",
     )
     ml_runtime, ml_available = model_options(valid_subjects)
+    st.caption(f"ML status badge: `{ml_runtime.get('status_badge', 'fallback_only')}`")
+    if ml_runtime.get("status_badge") == "artifact_incompatible":
+        st.warning(
+            "Saved ML artifact is incompatible with this app version. "
+            "Falling back to deterministic estimates unless retraining data is available."
+        )
+    if ml_runtime.get("artifact_reason"):
+        st.caption(f"Artifact compatibility reason: `{ml_runtime['artifact_reason']}`")
+    if ml_runtime.get("status_badge") == "historical_bundle":
+        st.info("Using an in-session model retrained from historical examples.")
+
     if mode != "Quick estimate" and not ml_available:
         st.warning("ML is not ready yet, so we are showing the rules-based estimate for now.")
     exportable_rows = []
@@ -448,7 +483,7 @@ def main() -> None:
         deterministic_pred = predict(subject)
         ml_percentage: float | None = None
         if ml_runtime["source"] == "artifact":
-            ml_percentage = predict_with_model(build_features(subject))
+            ml_percentage = predict_with_bundle(ml_runtime["bundle"], build_features(subject))
         elif ml_runtime["source"] == "historical_examples":
             ml_percentage = predict_with_bundle(ml_runtime["bundle"], build_features(subject))
         ml_pred = (

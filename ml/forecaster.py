@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from datetime import date
 from pathlib import Path
 from statistics import mean, pstdev
@@ -13,6 +14,7 @@ import pickle
 from core.predictor import Subject, parse_iso_date, predict
 
 MODEL_ARTIFACT_PATH = Path("artifacts/forecaster.pkl")
+MODEL_SCHEMA_VERSION = "1"
 FEATURE_KEYS = [
     "mean",
     "recent_mean",
@@ -31,6 +33,20 @@ FEATURE_KEYS = [
 class ModelBundle:
     linear_model: LinearRegression
     tree_model: RandomForestRegressor
+
+
+class ArtifactLoadStatus(str, Enum):
+    VALID = "artifact_valid"
+    MISSING = "artifact_missing"
+    INCOMPATIBLE = "artifact_incompatible"
+    MALFORMED = "artifact_malformed"
+
+
+@dataclass
+class BundleLoadResult:
+    bundle: ModelBundle | None
+    status: ArtifactLoadStatus
+    reason: str | None = None
 
 
 def _score_mean(values: list[float]) -> float:
@@ -131,6 +147,7 @@ def train_models(subjects: list[Subject], artifact_path: Path = MODEL_ARTIFACT_P
     with artifact_path.open("wb") as f:
         pickle.dump(
             {
+                "schema_version": MODEL_SCHEMA_VERSION,
                 "feature_keys": FEATURE_KEYS,
                 "linear_model": bundle.linear_model,
                 "tree_model": bundle.tree_model,
@@ -141,24 +158,47 @@ def train_models(subjects: list[Subject], artifact_path: Path = MODEL_ARTIFACT_P
     return bundle
 
 
-def load_model_bundle(artifact_path: Path = MODEL_ARTIFACT_PATH) -> ModelBundle | None:
+def load_model_bundle(artifact_path: Path = MODEL_ARTIFACT_PATH) -> BundleLoadResult:
     if not artifact_path.exists():
-        return None
+        return BundleLoadResult(bundle=None, status=ArtifactLoadStatus.MISSING, reason="artifact_missing")
 
     with artifact_path.open("rb") as f:
-        payload = pickle.load(f)
+        try:
+            payload = pickle.load(f)
+        except Exception:  # noqa: BLE001
+            return BundleLoadResult(bundle=None, status=ArtifactLoadStatus.MALFORMED, reason="artifact_unreadable")
+
+    schema_version = payload.get("schema_version")
+    if schema_version != MODEL_SCHEMA_VERSION:
+        return BundleLoadResult(
+            bundle=None,
+            status=ArtifactLoadStatus.INCOMPATIBLE,
+            reason=f"schema_version_mismatch:{schema_version!r}!={MODEL_SCHEMA_VERSION!r}",
+        )
+
+    feature_keys = payload.get("feature_keys")
+    if feature_keys != FEATURE_KEYS:
+        return BundleLoadResult(
+            bundle=None,
+            status=ArtifactLoadStatus.INCOMPATIBLE,
+            reason="feature_keys_mismatch",
+        )
 
     linear_model = payload.get("linear_model")
     tree_model = payload.get("tree_model")
     if linear_model is None or tree_model is None:
-        return None
+        return BundleLoadResult(bundle=None, status=ArtifactLoadStatus.MALFORMED, reason="missing_model_fields")
 
-    return ModelBundle(linear_model=linear_model, tree_model=tree_model)
+    return BundleLoadResult(
+        bundle=ModelBundle(linear_model=linear_model, tree_model=tree_model),
+        status=ArtifactLoadStatus.VALID,
+        reason=None,
+    )
 
 
 def predict_with_model(features: dict[str, float], artifact_path: Path = MODEL_ARTIFACT_PATH) -> float | None:
-    bundle = load_model_bundle(artifact_path)
-    if bundle is None:
+    load_result = load_model_bundle(artifact_path)
+    if load_result.bundle is None:
         return None
 
-    return predict_with_bundle(bundle, features)
+    return predict_with_bundle(load_result.bundle, features)
