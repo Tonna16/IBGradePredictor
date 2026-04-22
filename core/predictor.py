@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from math import exp
 from statistics import pstdev
 from typing import List
 
@@ -48,6 +49,14 @@ class SubjectPrediction:
     confidence_summary: str
 
 
+@dataclass(frozen=True)
+class ExamSignalConfig:
+    name: str
+    weighting_method: str
+    trend_method: str
+    alpha: float = 0.35
+
+
 @dataclass
 class TrendInsight:
     label: str
@@ -55,6 +64,9 @@ class TrendInsight:
     summary: str
     slope_per_test: float
     tests_used: int
+    intercept: float | None = None
+    projection_center: float | None = None
+    method: str = "legacy"
 
 
 @dataclass
@@ -80,7 +92,42 @@ def next_grade_threshold(current_grade: int) -> float | None:
     return None
 
 
-def weighted_average(scores: List[float]) -> float:
+LEGACY_EXAM_SIGNAL_CONFIG = ExamSignalConfig(
+    name="legacy",
+    weighting_method="linear_ramp",
+    trend_method="window_delta",
+    alpha=0.35,
+)
+UPGRADED_EXAM_SIGNAL_CONFIG = ExamSignalConfig(
+    name="upgraded_math",
+    weighting_method="exponential_decay",
+    trend_method="least_squares",
+    alpha=0.35,
+)
+EXAM_SIGNAL_CONFIGS = {
+    LEGACY_EXAM_SIGNAL_CONFIG.name: LEGACY_EXAM_SIGNAL_CONFIG,
+    UPGRADED_EXAM_SIGNAL_CONFIG.name: UPGRADED_EXAM_SIGNAL_CONFIG,
+}
+
+
+def weighted_average(scores: List[float], *, config: ExamSignalConfig = UPGRADED_EXAM_SIGNAL_CONFIG) -> float:
+    if not scores:
+        return 0.0
+
+    n = len(scores)
+    if config.weighting_method == "linear_ramp":
+        weights = list(range(1, n + 1))
+        return sum(s * w for s, w in zip(scores, weights)) / sum(weights)
+
+    alpha = max(0.0, config.alpha)
+    weights = [exp(alpha * i) for i in range(n)]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return 0.0
+    return sum(s * w for s, w in zip(scores, weights)) / total_weight
+
+
+def weighted_average_legacy(scores: List[float]) -> float:
     if not scores:
         return 0.0
     n = len(scores)
@@ -131,6 +178,25 @@ def moving_average(values: List[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
+
+
+def least_squares_trend(scores: List[float]) -> tuple[float, float] | None:
+    if len(scores) < 2:
+        return None
+
+    n = len(scores)
+    x_vals = list(range(n))
+    x_mean = sum(x_vals) / n
+    y_mean = sum(scores) / n
+
+    numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, scores))
+    denominator = sum((x - x_mean) ** 2 for x in x_vals)
+    if denominator == 0:
+        return 0.0, y_mean
+
+    slope = numerator / denominator
+    intercept = y_mean - slope * x_mean
+    return slope, intercept
 
 
 def parse_iso_date(raw: str) -> date | None:
@@ -216,23 +282,75 @@ def calculate_trend(scores: List[float], window: int = 3) -> TrendInsight | None
         summary=summary,
         slope_per_test=slope,
         tests_used=tests_used,
+        method="legacy",
     )
 
 
-def projection_band(exam_avg: float, slope_per_test: float, scenario: str) -> tuple[float, float]:
+def calculate_regression_trend(scores: List[float]) -> TrendInsight | None:
+    if len(scores) < 3:
+        return None
+
+    trend = least_squares_trend(scores)
+    if trend is None:
+        return None
+
+    slope, intercept = trend
+    first_fit = intercept
+    last_fit = intercept + slope * (len(scores) - 1)
+    change = last_fit - first_fit
+    projection_center = intercept + slope * len(scores)
+
+    if change > 1.5:
+        label = "improving"
+    elif change < -1.5:
+        label = "declining"
+    else:
+        label = "stagnant"
+
+    summary = (
+        f"regression slope {slope:+.2f} pts/test, intercept {intercept:.1f}, "
+        f"fit change {change:+.1f}% across {len(scores)} tests"
+    )
+    return TrendInsight(
+        label=label,
+        numeric_change=change,
+        summary=summary,
+        slope_per_test=slope,
+        tests_used=len(scores),
+        intercept=intercept,
+        projection_center=projection_center,
+        method="least_squares",
+    )
+
+
+def projection_band(
+    exam_avg: float,
+    slope_per_test: float,
+    scenario: str,
+    *,
+    projection_center: float | None = None,
+) -> tuple[float, float]:
     adjustments = {"conservative": -0.5, "neutral": 0.0, "optimistic": 0.5}
     bias = adjustments.get(scenario, 0.0)
-    center = exam_avg + slope_per_test + bias
+    center = (exam_avg + slope_per_test) if projection_center is None else projection_center
+    center += bias
     spread = max(1.5, abs(slope_per_test) * 1.25 + 1.0)
     low = max(0.0, min(100.0, center - spread))
     high = max(0.0, min(100.0, center + spread))
     return low, high
 
 
-def predict(subject: Subject) -> SubjectPrediction:
-    exam_avg = weighted_average(subject.test_scores)
+def predict(subject: Subject, signal_config: ExamSignalConfig = UPGRADED_EXAM_SIGNAL_CONFIG) -> SubjectPrediction:
+    use_legacy_fallback = len(subject.test_scores) < 3
+    active_config = LEGACY_EXAM_SIGNAL_CONFIG if use_legacy_fallback else signal_config
+
+    exam_avg = weighted_average(subject.test_scores, config=active_config)
     ia_est = subject.ia_estimated_score or 0.0
-    trend = calculate_trend(subject.test_scores)
+    if active_config.trend_method == "least_squares":
+        trend = calculate_regression_trend(subject.test_scores)
+    else:
+        trend = calculate_trend(subject.test_scores)
+
     trend_label = trend.label if trend is not None else "No trend"
     trend_summary = (
         trend.summary if trend is not None else "Need at least 3 tests to classify trend."
@@ -242,6 +360,7 @@ def predict(subject: Subject) -> SubjectPrediction:
         exam_avg,
         0.0 if trend is None else trend.slope_per_test,
         scenario,
+        projection_center=None if trend is None else trend.projection_center,
     )
     projected_low = projected_exam_low * subject.exam_weight + ia_est * subject.ia_weight
     projected_high = projected_exam_high * subject.exam_weight + ia_est * subject.ia_weight
@@ -412,3 +531,10 @@ def needed_exam_avg_for_target(
 
 def predict_subject(subject: Subject) -> SubjectPrediction:
     return predict(subject)
+
+
+def predict_side_by_side(subject: Subject) -> dict[str, SubjectPrediction]:
+    return {
+        LEGACY_EXAM_SIGNAL_CONFIG.name: predict(subject, LEGACY_EXAM_SIGNAL_CONFIG),
+        UPGRADED_EXAM_SIGNAL_CONFIG.name: predict(subject, UPGRADED_EXAM_SIGNAL_CONFIG),
+    }
