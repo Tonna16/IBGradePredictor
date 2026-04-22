@@ -1,0 +1,28 @@
+[
+  {
+    "mean": 62,
+    "recent_mean": 65,
+    "std": 7.4,
+    "slope": 1.2,
+    "test_count": 5,
+    "ia_estimate": 68,
+    "ia_progress": 78,
+    "recency_mean_days": 11,
+    "recency_std_days": 3,
+    "latest_days_ago": 7,
+    "actual_final_score": 66
+  },
+  {
+    "mean": 74,
+    "recent_mean": 77,
+    "std": 6.2,
+    "slope": 1.4,
+    "test_count": 6,
+    "ia_estimate": 73,
+    "ia_progress": 82,
+    "recency_mean_days": 9,
+    "recency_std_days": 4,
+    "latest_days_ago": 5,
+    "actual_final_score": 78
+  }
+]

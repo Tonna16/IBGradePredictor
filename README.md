@@ -34,3 +34,26 @@ streamlit run app.py
 ```
 
 ==
+
+## Historical evaluation dataset schema
+Use `data/historical_examples.csv` (or JSON) for model evaluation on held-out data.
+
+Expected columns/keys:
+- `mean`
+- `recent_mean`
+- `std`
+- `slope`
+- `test_count`
+- `ia_estimate`
+- `ia_progress`
+- `recency_mean_days`
+- `recency_std_days`
+- `latest_days_ago`
+- `actual_final_score`
+
+JSON schema: `data/historical_examples.schema.json`.
+
+Run evaluation:
+```bash
+python -m ml.evaluate --data data/historical_examples.csv
+```

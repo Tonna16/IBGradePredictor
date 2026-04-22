@@ -85,6 +85,32 @@ def _feature_matrix(feature_rows: Iterable[dict[str, float]]) -> list[list[float
     return [[float(row.get(k, 0.0)) for k in FEATURE_KEYS] for row in feature_rows]
 
 
+def train_models_from_feature_rows(
+    feature_rows: list[dict[str, float]],
+    targets: list[float],
+) -> ModelBundle | None:
+    if len(feature_rows) < 2 or len(feature_rows) != len(targets):
+        return None
+
+    x = _feature_matrix(feature_rows)
+    y_vals = [float(y) for y in targets]
+
+    linear_model = LinearRegression()
+    linear_model.fit(x, y_vals)
+
+    tree_model = RandomForestRegressor(n_estimators=200, random_state=42)
+    tree_model.fit(x, y_vals)
+    return ModelBundle(linear_model=linear_model, tree_model=tree_model)
+
+
+def predict_with_bundle(bundle: ModelBundle, features: dict[str, float]) -> float:
+    row = _feature_matrix([features])
+    linear_pred = float(bundle.linear_model.predict(row)[0])
+    tree_pred = float(bundle.tree_model.predict(row)[0])
+    combined = (linear_pred + tree_pred) / 2.0
+    return max(0.0, min(100.0, combined))
+
+
 def train_models(subjects: list[Subject], artifact_path: Path = MODEL_ARTIFACT_PATH) -> ModelBundle | None:
     if not subjects:
         return None
@@ -97,29 +123,22 @@ def train_models(subjects: list[Subject], artifact_path: Path = MODEL_ARTIFACT_P
         x_rows.append(build_features(subject))
         y_vals.append(predict(subject).predicted_final_percentage)
 
-    if len(x_rows) < 2:
+    bundle = train_models_from_feature_rows(x_rows, y_vals)
+    if bundle is None:
         return None
-
-    x = _feature_matrix(x_rows)
-
-    linear_model = LinearRegression()
-    linear_model.fit(x, y_vals)
-
-    tree_model = RandomForestRegressor(n_estimators=200, random_state=42)
-    tree_model.fit(x, y_vals)
 
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     with artifact_path.open("wb") as f:
         pickle.dump(
             {
                 "feature_keys": FEATURE_KEYS,
-                "linear_model": linear_model,
-                "tree_model": tree_model,
+                "linear_model": bundle.linear_model,
+                "tree_model": bundle.tree_model,
             },
             f,
         )
 
-    return ModelBundle(linear_model=linear_model, tree_model=tree_model)
+    return bundle
 
 
 def load_model_bundle(artifact_path: Path = MODEL_ARTIFACT_PATH) -> ModelBundle | None:
@@ -142,8 +161,4 @@ def predict_with_model(features: dict[str, float], artifact_path: Path = MODEL_A
     if bundle is None:
         return None
 
-    row = _feature_matrix([features])
-    linear_pred = float(bundle.linear_model.predict(row)[0])
-    tree_pred = float(bundle.tree_model.predict(row)[0])
-    combined = (linear_pred + tree_pred) / 2.0
-    return max(0.0, min(100.0, combined))
+    return predict_with_bundle(bundle, features)
