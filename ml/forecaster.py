@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from statistics import mean, pstdev
+from typing import Iterable
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+import pickle
+
+from core.predictor import Subject, parse_iso_date, predict
+
+MODEL_ARTIFACT_PATH = Path("artifacts/forecaster.pkl")
+FEATURE_KEYS = [
+    "mean",
+    "recent_mean",
+    "std",
+    "slope",
+    "test_count",
+    "ia_estimate",
+    "ia_progress",
+    "recency_mean_days",
+    "recency_std_days",
+    "latest_days_ago",
+]
+
+
+@dataclass
+class ModelBundle:
+    linear_model: LinearRegression
+    tree_model: RandomForestRegressor
+
+
+def _score_mean(values: list[float]) -> float:
+    return mean(values) if values else 0.0
+
+
+def _score_std(values: list[float]) -> float:
+    return pstdev(values) if len(values) >= 2 else 0.0
+
+
+def _least_squares_slope(scores: list[float]) -> float:
+    if len(scores) < 2:
+        return 0.0
+    n = len(scores)
+    xs = list(range(n))
+    x_mean = sum(xs) / n
+    y_mean = sum(scores) / n
+    numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, scores))
+    denominator = sum((x - x_mean) ** 2 for x in xs)
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _recency_day_offsets(assessment_dates: list[str]) -> list[int]:
+    valid_dates = [parse_iso_date(d) for d in assessment_dates]
+    valid_dates = [d for d in valid_dates if d is not None]
+    today = date.today()
+    return [max(0, (today - d).days) for d in valid_dates]
+
+
+def build_features(subject: Subject) -> dict[str, float]:
+    scores = subject.test_scores
+    recent_window = scores[-3:] if len(scores) >= 3 else scores
+    recency_offsets = _recency_day_offsets(subject.assessment_dates)
+
+    return {
+        "mean": _score_mean(scores),
+        "recent_mean": _score_mean(recent_window),
+        "std": _score_std(scores),
+        "slope": _least_squares_slope(scores),
+        "test_count": float(len(scores)),
+        "ia_estimate": 0.0 if subject.ia_estimated_score is None else float(subject.ia_estimated_score),
+        "ia_progress": float(subject.ia_progress_pct),
+        "recency_mean_days": _score_mean([float(x) for x in recency_offsets]),
+        "recency_std_days": _score_std([float(x) for x in recency_offsets]),
+        "latest_days_ago": float(min(recency_offsets)) if recency_offsets else 999.0,
+    }
+
+
+def _feature_matrix(feature_rows: Iterable[dict[str, float]]) -> list[list[float]]:
+    return [[float(row.get(k, 0.0)) for k in FEATURE_KEYS] for row in feature_rows]
+
+
+def train_models(subjects: list[Subject], artifact_path: Path = MODEL_ARTIFACT_PATH) -> ModelBundle | None:
+    if not subjects:
+        return None
+
+    x_rows = []
+    y_vals = []
+    for subject in subjects:
+        if not subject.test_scores:
+            continue
+        x_rows.append(build_features(subject))
+        y_vals.append(predict(subject).predicted_final_percentage)
+
+    if len(x_rows) < 2:
+        return None
+
+    x = _feature_matrix(x_rows)
+
+    linear_model = LinearRegression()
+    linear_model.fit(x, y_vals)
+
+    tree_model = RandomForestRegressor(n_estimators=200, random_state=42)
+    tree_model.fit(x, y_vals)
+
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    with artifact_path.open("wb") as f:
+        pickle.dump(
+            {
+                "feature_keys": FEATURE_KEYS,
+                "linear_model": linear_model,
+                "tree_model": tree_model,
+            },
+            f,
+        )
+
+    return ModelBundle(linear_model=linear_model, tree_model=tree_model)
+
+
+def load_model_bundle(artifact_path: Path = MODEL_ARTIFACT_PATH) -> ModelBundle | None:
+    if not artifact_path.exists():
+        return None
+
+    with artifact_path.open("rb") as f:
+        payload = pickle.load(f)
+
+    linear_model = payload.get("linear_model")
+    tree_model = payload.get("tree_model")
+    if linear_model is None or tree_model is None:
+        return None
+
+    return ModelBundle(linear_model=linear_model, tree_model=tree_model)
+
+
+def predict_with_model(features: dict[str, float], artifact_path: Path = MODEL_ARTIFACT_PATH) -> float | None:
+    bundle = load_model_bundle(artifact_path)
+    if bundle is None:
+        return None
+
+    row = _feature_matrix([features])
+    linear_pred = float(bundle.linear_model.predict(row)[0])
+    tree_pred = float(bundle.tree_model.predict(row)[0])
+    combined = (linear_pred + tree_pred) / 2.0
+    return max(0.0, min(100.0, combined))

@@ -7,7 +7,9 @@ from core.io import subject_from_dict, subject_to_dict
 from core.predictor import (
     GRADE_BOUNDS,
     Subject,
+    SubjectPrediction,
     exam_component_from_trajectory,
+    grade_from_score,
     needed_ia_quality_for_target,
     normalize_weights,
     parse_iso_date,
@@ -15,6 +17,19 @@ from core.predictor import (
     required_remaining_exam_average,
     risk_alerts,
 )
+from ml.forecaster import build_features, predict_with_model
+
+
+def prediction_from_percentage(subject: Subject, predicted_percentage: float) -> SubjectPrediction:
+    deterministic = predict(subject)
+    predicted_final = max(0.0, min(100.0, predicted_percentage))
+    predicted_grade = grade_from_score(predicted_final)
+    next_threshold = next((low for grade, low, _ in GRADE_BOUNDS if grade == predicted_grade + 1), None)
+
+    deterministic.predicted_final_percentage = predicted_final
+    deterministic.predicted_grade = predicted_grade
+    deterministic.gap_to_next_grade = 0.0 if next_threshold is None else max(0.0, next_threshold - predicted_final)
+    return deterministic
 
 
 def default_subject(name: str = "New Subject") -> Subject:
@@ -294,12 +309,31 @@ def main() -> None:
         st.info("No valid subjects to predict yet.")
         return
 
+    mode = st.radio(
+        "Prediction mode",
+        options=["Deterministic", "ML", "Compare"],
+        horizontal=True,
+        help="ML mode uses saved artifact if available. Without an artifact, deterministic prediction is used.",
+    )
+
     st.markdown("---")
     st.subheader("Per-subject forecast")
 
     summary_rows = []
+    selected_predictions: dict[str, SubjectPrediction] = {}
     for subject in valid_subjects:
-        pred = predict(subject)
+        deterministic_pred = predict(subject)
+        ml_percentage = predict_with_model(build_features(subject))
+        ml_pred = (
+            prediction_from_percentage(subject, ml_percentage)
+            if ml_percentage is not None
+            else deterministic_pred
+        )
+        pred = deterministic_pred if mode == "Deterministic" else ml_pred
+        if mode == "Compare":
+            pred = deterministic_pred
+
+        selected_predictions[subject.name] = pred
         ci_pct = f"{pred.ci_confidence_level * 100:.0f}%"
         prediction_text = (
             f"Grade {pred.predicted_grade}, {pred.predicted_final_percentage:.0f}% "
@@ -328,12 +362,23 @@ def main() -> None:
                 "Needed for next grade": needed_text,
             }
         )
+        if mode == "Compare":
+            summary_rows[-1]["Deterministic %"] = round(deterministic_pred.predicted_final_percentage, 1)
+            summary_rows[-1]["ML %"] = round(ml_pred.predicted_final_percentage, 1)
+            summary_rows[-1]["|Δ|"] = round(
+                abs(deterministic_pred.predicted_final_percentage - ml_pred.predicted_final_percentage),
+                2,
+            )
+        elif mode == "ML":
+            summary_rows[-1]["ML artifact status"] = (
+                "loaded" if ml_percentage is not None else "missing artifact (fallback to deterministic)"
+            )
 
     st.dataframe(summary_rows, use_container_width=True, hide_index=True)
 
     st.subheader("Risk & scenario intervention planner")
     for idx, subject in enumerate(valid_subjects):
-        baseline_pred = predict(subject)
+        baseline_pred = selected_predictions.get(subject.name, predict(subject))
         with st.container(border=True):
             st.markdown(f"**{subject.name}**")
             alerts = risk_alerts(subject, baseline_pred)
@@ -480,7 +525,7 @@ def main() -> None:
 
     st.subheader("Advice")
     for subject in valid_subjects:
-        pred = predict(subject)
+        pred = selected_predictions.get(subject.name, predict(subject))
         if pred.confidence_level == "Low":
             advice = (
                 "Low confidence: collect more test evidence (and recent assessments) before "
@@ -495,7 +540,7 @@ def main() -> None:
     st.subheader("Priority ranking")
     ranking = []
     for subject in valid_subjects:
-        pred = predict(subject)
+        pred = selected_predictions.get(subject.name, predict(subject))
         effort_metric = pred.gap_to_next_grade
         exam_need_metric = pred.needed_exam_avg_for_next or 0.0
         ranking.append(
