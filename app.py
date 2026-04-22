@@ -300,8 +300,10 @@ def main() -> None:
     summary_rows = []
     for subject in valid_subjects:
         pred = predict(subject)
+        ci_pct = f"{pred.ci_confidence_level * 100:.0f}%"
         prediction_text = (
             f"Grade {pred.predicted_grade}, {pred.predicted_final_percentage:.0f}% "
+            f"(CI {ci_pct}: {pred.ci_low:.1f}%–{pred.ci_high:.1f}%) "
             f"— {pred.confidence_level} confidence"
         )
         needed_text = (
@@ -322,6 +324,7 @@ def main() -> None:
                 "Overall confidence": f"{pred.confidence_level} ({pred.confidence_score:.0f}/100)",
                 "Trend": f"{pred.trend_label} ({pred.trend_summary})",
                 "Projection band": f"{pred.projected_range[0]:.1f}%–{pred.projected_range[1]:.1f}%",
+                "Confidence interval": f"{ci_pct}: {pred.ci_low:.1f}%–{pred.ci_high:.1f}%",
                 "Needed for next grade": needed_text,
             }
         )
@@ -364,9 +367,11 @@ def main() -> None:
 
             sim_subject = scenario_subject(subject, float(next_test_score), float(scenario_ia))
             sim_pred = predict(sim_subject)
+            sim_ci_pct = f"{sim_pred.ci_confidence_level * 100:.0f}%"
             st.info(
                 "Scenario result: "
                 f"{sim_pred.predicted_final_percentage:.1f}% (Grade {sim_pred.predicted_grade}) · "
+                f"{sim_ci_pct} CI {sim_pred.ci_low:.1f}%–{sim_pred.ci_high:.1f}% · "
                 f"{sim_pred.confidence_level} confidence ({sim_pred.confidence_score:.0f}/100)"
             )
 
