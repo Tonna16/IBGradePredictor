@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import Any, List
 
 import streamlit as st
@@ -18,6 +19,7 @@ from core.predictor import (
     risk_alerts,
 )
 from ml.forecaster import build_features, predict_with_model
+from ml.evaluate import evaluate_models, load_historical_examples
 
 
 def prediction_from_percentage(subject: Subject, predicted_percentage: float) -> SubjectPrediction:
@@ -315,6 +317,19 @@ def main() -> None:
         horizontal=True,
         help="ML mode uses saved artifact if available. Without an artifact, deterministic prediction is used.",
     )
+
+    st.subheader("Model evidence (held-out historical MAE)")
+    evidence_source = Path("data/historical_examples.csv")
+    historical_examples = load_historical_examples(evidence_source)
+    evidence_rows = evaluate_models(historical_examples, include_rmse=True)
+    if evidence_rows:
+        st.caption(f"Read-only comparison from held-out split of `{evidence_source}`.")
+        st.table(evidence_rows)
+    else:
+        st.info(
+            "No historical evidence table available yet. "
+            "Add at least 4 examples to data/historical_examples.csv or data/historical_examples.json."
+        )
 
     st.markdown("---")
     st.subheader("Per-subject forecast")
